@@ -40,6 +40,7 @@ def read_countries_from_bigquery() -> pd.DataFrame:
       li_classes
     FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
     WHERE name = path
+    AND name = 'Slovakia'
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY url
       ORDER BY load_timestamp DESC
