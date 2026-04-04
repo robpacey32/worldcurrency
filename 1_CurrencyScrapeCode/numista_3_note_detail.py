@@ -204,9 +204,6 @@ def scrape_note(note_url: str) -> dict:
 if __name__ == "__main__":
     df_links = read_note_links_from_bigquery()
 
-    # TEMP TEST FILTER
-    df_links = df_links[df_links["note_url"] == "https://en.numista.com/247092"]
-
     all_rows = []
 
     for _, row in df_links.iterrows():
