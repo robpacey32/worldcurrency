@@ -18,6 +18,35 @@ DATASET = "numistascrape"
 SOURCE_TABLE = "2_NotesPerCountry"
 TARGET_TABLE = "3_NoteDetail"
 
+EXPECTED_COLUMNS = [
+    "Note Title",
+    "Issuer",
+    "Period",
+    "Type",
+    "Year",
+    "Value",
+    "Currency",
+    "Composition",
+    "Size",
+    "Shape",
+    "Issued",
+    "Demonetized",
+    "Number",
+    "References",
+    "Obverse Description",
+    "Obverse Script",
+    "Obverse Lettering",
+    "Reverse Description",
+    "Reverse Script",
+    "Reverse Lettering",
+    "Printer",
+    "Image Front",
+    "Image Back",
+    "Image Credit",
+    "Note URL",
+    "load_timestamp",
+]
+
 
 # -------------------------
 # BIGQUERY
@@ -42,7 +71,8 @@ def read_note_links_from_bigquery() -> pd.DataFrame:
       ORDER BY load_timestamp DESC
     ) = 1
     """
-    return client.query(query).to_dataframe(create_bqstorage_client=False)
+    rows = list(client.query(query).result())
+    return pd.DataFrame([dict(row.items()) for row in rows])
 
 
 def upload_to_bigquery(df: pd.DataFrame) -> None:
@@ -204,16 +234,36 @@ def scrape_note(note_url: str) -> dict:
 if __name__ == "__main__":
     df_links = read_note_links_from_bigquery()
 
+    total_notes = len(df_links)
+    success_count = 0
+    fail_count = 0
     all_rows = []
 
-    for _, row in df_links.iterrows():
-        print("Scraping:", row["note_url"])
-        note_data = scrape_note(row["note_url"])
-        all_rows.append(note_data)
+    print(f"Total notes to scrape: {total_notes}")
+
+    for i, (_, row) in enumerate(df_links.iterrows(), start=1):
+        note_url = row["note_url"]
+        print(f"[{i}/{total_notes}] Scraping: {note_url}")
+
+        try:
+            note_data = scrape_note(note_url)
+            all_rows.append(note_data)
+            success_count += 1
+            print(f"Completed {i}/{total_notes} | Success: {success_count} | Failed: {fail_count}")
+        except Exception as e:
+            fail_count += 1
+            print(f"FAILED {i}/{total_notes} | {note_url} | {e}")
 
     df_notes = pd.DataFrame(all_rows)
     df_notes["load_timestamp"] = datetime.now(timezone.utc)
 
-    print(df_notes.T)
+    for col in EXPECTED_COLUMNS:
+        if col not in df_notes.columns:
+            df_notes[col] = None
+
+    df_notes = df_notes[EXPECTED_COLUMNS]
+
+    print(df_notes.head())
+    print(f"Finished. Success: {success_count}, Failed: {fail_count}, Total: {total_notes}")
 
     upload_to_bigquery(df_notes)
