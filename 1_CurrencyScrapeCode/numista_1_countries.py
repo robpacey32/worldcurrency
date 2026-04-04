@@ -4,13 +4,11 @@ from datetime import datetime, timezone
 import pandas as pd
 import os
 import json
+import time
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -46,11 +44,12 @@ def upload_to_bigquery(df: pd.DataFrame) -> None:
 
 def get_driver() -> webdriver.Chrome:
     options = Options()
-    options.add_argument("--headless=new")
+    options.add_argument("--headless")
     options.add_argument("--window-size=1600,1400")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(
         "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -64,10 +63,20 @@ def get_page_html(url: str) -> str:
     driver = get_driver()
     try:
         driver.get(url)
+
         WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "ul.liste_pays"))
+            lambda d: d.execute_script("return document.readyState") == "complete"
         )
-        return driver.page_source
+
+        time.sleep(5)
+
+        html = driver.page_source
+
+        print("PAGE TITLE:", driver.title)
+        print("CURRENT URL:", driver.current_url)
+        print("HTML START:", html[:2000])
+
+        return html
     finally:
         driver.quit()
 
@@ -140,7 +149,9 @@ def scrape_liste_pays(page_url: str) -> pd.DataFrame:
 
     root_ul = soup.find("ul", class_="liste_pays")
     if root_ul is None:
-        raise ValueError("Could not find ul.liste_pays on page")
+        with open("debug_numista_page.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        raise ValueError("Could not find ul.liste_pays on page; wrote debug_numista_page.html")
 
     for li in root_ul.find_all("li", recursive=False):
         rows.extend(walk_tree(li))
