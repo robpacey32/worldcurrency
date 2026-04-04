@@ -1,0 +1,7 @@
+pandas
+beautifulsoup4
+selenium
+google-cloud-bigquery
+pyarrow
+db-dtypes
+lxml
