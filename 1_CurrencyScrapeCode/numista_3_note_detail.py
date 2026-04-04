@@ -42,7 +42,7 @@ def read_note_links_from_bigquery() -> pd.DataFrame:
       ORDER BY load_timestamp DESC
     ) = 1
     """
-    return client.query(query).to_dataframe()
+    return client.query(query).to_dataframe(create_bqstorage_client=False)
 
 
 def upload_to_bigquery(df: pd.DataFrame) -> None:
