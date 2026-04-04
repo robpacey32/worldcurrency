@@ -1,0 +1,30 @@
+name: Numista 2 Notes Per Country
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape-notes-per-country:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Python packages
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run notes-per-country scrape
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python 1_CurrencyScrapeCode/numista_2_notes_per_country.py
