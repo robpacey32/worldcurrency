@@ -5,3 +5,5 @@ google-cloud-bigquery
 pyarrow
 db-dtypes
 lxml
+google-cloud-bigquery-storage
+pandas-gbq>=0.26.1
