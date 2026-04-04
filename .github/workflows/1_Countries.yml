@@ -1,4 +1,4 @@
-name: Numista 1 Countries
+name: 1. Numista Countries
 
 on:
   workflow_dispatch:
