@@ -1,0 +1,30 @@
+name: Numista 1 Countries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape-countries:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Python packages
+        run: |
+          pip install pandas beautifulsoup4 selenium google-cloud-bigquery pyarrow db-dtypes
+
+      - name: Run countries scrape
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python numista_1_countries.py
