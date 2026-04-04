@@ -27,4 +27,4 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: |
-          python numista_1_countries.py
+          python 1_CurrencyScrapeCode/numista_1_countries.py
