@@ -1,4 +1,4 @@
-name: 1. Numista Countries
+name: Numista 1 Countries
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
 
       - name: Install Python packages
         run: |
-          pip install pandas beautifulsoup4 selenium google-cloud-bigquery pyarrow db-dtypes
+          pip install -r requirements.txt
 
       - name: Run countries scrape
         env:
