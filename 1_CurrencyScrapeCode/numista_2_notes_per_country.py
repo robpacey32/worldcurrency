@@ -40,13 +40,13 @@ def read_countries_from_bigquery() -> pd.DataFrame:
       li_classes
     FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
     WHERE name = path
-    AND name = 'Slovakia'
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY url
       ORDER BY load_timestamp DESC
     ) = 1
     """
-    return client.query(query).to_dataframe(create_bqstorage_client=False)
+    rows = list(client.query(query).result())
+    return pd.DataFrame([dict(row.items()) for row in rows])
 
 
 def upload_to_bigquery(df: pd.DataFrame) -> None:
@@ -101,12 +101,20 @@ def get_page_html(url: str) -> str:
         driver.quit()
 
 
-def scrape_note_links_all_pages(first_page_url: str, issuer_name: str) -> list:
+def build_banknote_url(country_url: str) -> str:
+    slug = country_url.split("/")[-1].replace("-1.html", "")
+    return (
+        f"https://en.numista.com/catalogue/index.php"
+        f"?e={slug}&r=&st=148&cat=y&im1=&im2=&ru=&ie=&no=&v=&cu=&a=&dg=&i=&b=&m=&f=&t=&t2=&w=&mt=&u=&g="
+    )
+
+
+def scrape_note_links_all_pages(base_url: str, issuer_name: str) -> list:
     page = 1
     rows = []
 
     while True:
-        url = first_page_url.replace("-1.html", f"-{page}.html")
+        url = f"{base_url}&p={page}"
         print(f"Scraping {issuer_name} - page {page}")
 
         html = get_page_html(url)
@@ -116,6 +124,8 @@ def scrape_note_links_all_pages(first_page_url: str, issuer_name: str) -> list:
 
         if not blocks:
             break
+
+        page_rows = 0
 
         for block in blocks:
             a = block.select_one("strong a")
@@ -135,6 +145,12 @@ def scrape_note_links_all_pages(first_page_url: str, issuer_name: str) -> list:
                 "note_title": title,
                 "note_url": note_url
             })
+            page_rows += 1
+
+        print(f"Found {page_rows} banknotes on page {page}")
+
+        if page_rows == 0:
+            break
 
         page += 1
 
@@ -144,15 +160,14 @@ def scrape_note_links_all_pages(first_page_url: str, issuer_name: str) -> list:
 if __name__ == "__main__":
     df_issuers = read_countries_from_bigquery()
 
-    df_issuers = df_issuers[df_issuers["url"].str.contains("-1.html", na=False)].copy()
-
     all_rows = []
 
     for _, row in df_issuers.iterrows():
         issuer_name = row["name"]
         issuer_url = row["url"]
 
-        rows = scrape_note_links_all_pages(issuer_url, issuer_name)
+        banknote_url = build_banknote_url(issuer_url)
+        rows = scrape_note_links_all_pages(banknote_url, issuer_name)
         all_rows.extend(rows)
 
     df_notes = pd.DataFrame(all_rows).drop_duplicates(subset=["issuer_name", "note_url"]).reset_index(drop=True)
