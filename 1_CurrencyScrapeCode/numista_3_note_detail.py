@@ -17,6 +17,7 @@ PROJECT_ID = "currency-pacey32-github"
 DATASET = "numistascrape"
 SOURCE_TABLE = "2_NotesPerCountry"
 TARGET_TABLE = "3_NoteDetail"
+BATCH_SIZE = 50
 
 EXPECTED_COLUMNS = [
     "Note Title",
@@ -88,6 +89,10 @@ def read_note_links_from_bigquery() -> pd.DataFrame:
 
 
 def upload_to_bigquery(df: pd.DataFrame) -> None:
+    if df.empty:
+        print("No rows to upload.")
+        return
+
     client = get_bq_client()
     table_id = f"{PROJECT_ID}.{DATASET}.{TARGET_TABLE}"
 
@@ -130,7 +135,7 @@ def get_page_html(url: str) -> str:
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
-        time.sleep(3)
+        time.sleep(5)
 
         return driver.page_source
     finally:
@@ -220,14 +225,32 @@ def extract_note_title(soup):
     return None
 
 
-def scrape_note(note_url: str) -> dict:
+def scrape_note(note_url: str) -> dict | None:
     html = get_page_html(note_url)
     soup = BeautifulSoup(html, "html.parser")
+
+    has_features = soup.select_one("#fiche_caracteristiques") is not None
+    has_descriptions = soup.select_one("#fiche_descriptions") is not None
+    has_photo = soup.select_one("#fiche_photo") is not None
+
+    if not has_features or not has_descriptions or not has_photo:
+        print(f"Skipping bad page structure: {note_url}")
+        print("Title tag:", soup.title.get_text(" ", strip=True) if soup.title else None)
+        print("Has features:", has_features)
+        print("Has descriptions:", has_descriptions)
+        print("Has photo:", has_photo)
+        print("HTML start:", html[:1000])
+        return None
 
     features = extract_features(soup)
     descriptions = extract_descriptions(soup)
     images = extract_images_and_credit(soup)
     title = extract_note_title(soup)
+
+    if not title and not features and not descriptions and not images:
+        print(f"Skipping empty scrape: {note_url}")
+        print("HTML start:", html[:1000])
+        return None
 
     data = {
         "Note Title": title,
@@ -237,7 +260,31 @@ def scrape_note(note_url: str) -> dict:
         "Note URL": note_url
     }
 
+    # Extra safety: do not insert effectively empty rows
+    meaningful_values = [
+        data.get("Note Title"),
+        data.get("Issuer"),
+        data.get("Type"),
+        data.get("Composition"),
+        data.get("Number"),
+    ]
+    if all(v is None or str(v).strip() == "" for v in meaningful_values):
+        print(f"Skipping null-like row: {note_url}")
+        return None
+
     return data
+
+
+def prepare_batch_df(batch_rows: list[dict]) -> pd.DataFrame:
+    df_batch = pd.DataFrame(batch_rows)
+    df_batch["load_timestamp"] = datetime.now(timezone.utc)
+
+    for col in EXPECTED_COLUMNS:
+        if col not in df_batch.columns:
+            df_batch[col] = None
+
+    df_batch = df_batch[EXPECTED_COLUMNS]
+    return df_batch
 
 
 # -------------------------
@@ -249,7 +296,6 @@ if __name__ == "__main__":
     total_notes = len(df_links)
     success_count = 0
     fail_count = 0
-    batch_size = 50
     batch_rows = []
 
     print(f"Total notes still to scrape: {total_notes}")
@@ -268,20 +314,11 @@ if __name__ == "__main__":
 
             batch_rows.append(note_data)
             success_count += 1
-
             print(f"Completed {i}/{total_notes} | Success: {success_count} | Failed: {fail_count}")
 
-            if len(batch_rows) >= batch_size:
-                df_batch = pd.DataFrame(batch_rows)
-                df_batch["load_timestamp"] = datetime.now(timezone.utc)
-
-                for col in EXPECTED_COLUMNS:
-                    if col not in df_batch.columns:
-                        df_batch[col] = None
-
-                df_batch = df_batch[EXPECTED_COLUMNS]
+            if len(batch_rows) >= BATCH_SIZE:
+                df_batch = prepare_batch_df(batch_rows)
                 upload_to_bigquery(df_batch)
-
                 print(f"Uploaded batch of {len(df_batch)} rows")
                 batch_rows = []
 
@@ -290,16 +327,8 @@ if __name__ == "__main__":
             print(f"FAILED {i}/{total_notes} | {note_url} | {e}")
 
     if batch_rows:
-        df_batch = pd.DataFrame(batch_rows)
-        df_batch["load_timestamp"] = datetime.now(timezone.utc)
-
-        for col in EXPECTED_COLUMNS:
-            if col not in df_batch.columns:
-                df_batch[col] = None
-
-        df_batch = df_batch[EXPECTED_COLUMNS]
+        df_batch = prepare_batch_df(batch_rows)
         upload_to_bigquery(df_batch)
-
         print(f"Uploaded final batch of {len(df_batch)} rows")
 
     print(f"Finished. Success: {success_count}, Failed: {fail_count}, Total remaining at start: {total_notes}")
