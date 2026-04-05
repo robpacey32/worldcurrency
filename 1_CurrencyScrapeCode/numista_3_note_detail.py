@@ -61,15 +61,27 @@ def get_bq_client() -> bigquery.Client:
 def read_note_links_from_bigquery() -> pd.DataFrame:
     client = get_bq_client()
     query = f"""
-    SELECT
-      issuer_name,
-      note_title,
-      note_url
-    FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
-    QUALIFY ROW_NUMBER() OVER (
-      PARTITION BY note_url
-      ORDER BY load_timestamp DESC
-    ) = 1
+    WITH latest_links AS (
+      SELECT
+        issuer_name,
+        note_title,
+        note_url
+      FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY note_url
+        ORDER BY load_timestamp DESC
+      ) = 1
+    ),
+    already_done AS (
+      SELECT DISTINCT `Note URL` AS note_url
+      FROM `{PROJECT_ID}.{DATASET}.{TARGET_TABLE}`
+      WHERE `Note URL` IS NOT NULL
+    )
+    SELECT l.*
+    FROM latest_links l
+    LEFT JOIN already_done d
+      ON l.note_url = d.note_url
+    WHERE d.note_url IS NULL
     """
     rows = list(client.query(query).result())
     return pd.DataFrame([dict(row.items()) for row in rows])
@@ -237,9 +249,10 @@ if __name__ == "__main__":
     total_notes = len(df_links)
     success_count = 0
     fail_count = 0
-    all_rows = []
+    batch_size = 50
+    batch_rows = []
 
-    print(f"Total notes to scrape: {total_notes}")
+    print(f"Total notes still to scrape: {total_notes}")
 
     for i, (_, row) in enumerate(df_links.iterrows(), start=1):
         note_url = row["note_url"]
@@ -247,23 +260,46 @@ if __name__ == "__main__":
 
         try:
             note_data = scrape_note(note_url)
-            all_rows.append(note_data)
+
+            if note_data is None:
+                fail_count += 1
+                print(f"Skipped {i}/{total_notes} | {note_url}")
+                continue
+
+            batch_rows.append(note_data)
             success_count += 1
+
             print(f"Completed {i}/{total_notes} | Success: {success_count} | Failed: {fail_count}")
+
+            if len(batch_rows) >= batch_size:
+                df_batch = pd.DataFrame(batch_rows)
+                df_batch["load_timestamp"] = datetime.now(timezone.utc)
+
+                for col in EXPECTED_COLUMNS:
+                    if col not in df_batch.columns:
+                        df_batch[col] = None
+
+                df_batch = df_batch[EXPECTED_COLUMNS]
+                upload_to_bigquery(df_batch)
+
+                print(f"Uploaded batch of {len(df_batch)} rows")
+                batch_rows = []
+
         except Exception as e:
             fail_count += 1
             print(f"FAILED {i}/{total_notes} | {note_url} | {e}")
 
-    df_notes = pd.DataFrame(all_rows)
-    df_notes["load_timestamp"] = datetime.now(timezone.utc)
+    if batch_rows:
+        df_batch = pd.DataFrame(batch_rows)
+        df_batch["load_timestamp"] = datetime.now(timezone.utc)
 
-    for col in EXPECTED_COLUMNS:
-        if col not in df_notes.columns:
-            df_notes[col] = None
+        for col in EXPECTED_COLUMNS:
+            if col not in df_batch.columns:
+                df_batch[col] = None
 
-    df_notes = df_notes[EXPECTED_COLUMNS]
+        df_batch = df_batch[EXPECTED_COLUMNS]
+        upload_to_bigquery(df_batch)
 
-    print(df_notes.head())
-    print(f"Finished. Success: {success_count}, Failed: {fail_count}, Total: {total_notes}")
+        print(f"Uploaded final batch of {len(df_batch)} rows")
 
-    upload_to_bigquery(df_notes)
+    print(f"Finished. Success: {success_count}, Failed: {fail_count}, Total remaining at start: {total_notes}")
