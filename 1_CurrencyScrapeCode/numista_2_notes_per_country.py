@@ -89,7 +89,7 @@ def get_page_html(url: str) -> str:
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
-        time.sleep(5)
+        time.sleep(2)
 
         html = driver.page_source
 
