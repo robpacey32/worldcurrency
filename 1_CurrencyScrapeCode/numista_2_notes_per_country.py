@@ -40,6 +40,9 @@ def read_countries_from_bigquery() -> pd.DataFrame:
       li_classes
     FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
     WHERE name = path
+    -- TESTING
+    AND name = 'Afghanistan'
+    --
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY url
       ORDER BY load_timestamp DESC
@@ -105,17 +108,27 @@ def build_banknote_url(country_url: str) -> str:
     slug = country_url.split("/")[-1].replace("-1.html", "")
     return (
         f"https://en.numista.com/catalogue/index.php"
-        f"?e={slug}&r=&st=148&cat=y&im1=&im2=&ru=&ie=&no=&v=&cu=&a=&dg=&i=&b=&m=&f=&t=&t2=&w=&mt=&u=&g="
+        f"?e={slug}"
+        f"&r=&st=148&cat=y"
+        f"&im1=&im2=&ru=&ie=&no=&v=&cu=&a=&dg=&i=&b=&m=&f=&t=&t2=&w=&mt=&u=&g="
+        f"&p=1"
     )
 
 
-def scrape_note_links_all_pages(base_url: str, issuer_name: str) -> list:
+def set_page_number(url: str, page: int) -> str:
+    if "&p=" in url:
+        return url.rsplit("&p=", 1)[0] + f"&p={page}"
+    return url + f"&p={page}"
+
+
+def scrape_note_links_all_pages(start_url: str, issuer_name: str) -> list:
     page = 1
     rows = []
 
     while True:
-        url = f"{base_url}&p={page}"
+        url = set_page_number(start_url, page)
         print(f"Scraping {issuer_name} - page {page}")
+        print(f"REQUEST URL: {url}")
 
         html = get_page_html(url)
         soup = BeautifulSoup(html, "html.parser")
@@ -123,6 +136,7 @@ def scrape_note_links_all_pages(base_url: str, issuer_name: str) -> list:
         blocks = soup.select("div.resultat_recherche div.description_piece")
 
         if not blocks:
+            print(f"No note blocks found for {issuer_name} on page {page}")
             break
 
         page_rows = 0
@@ -136,7 +150,7 @@ def scrape_note_links_all_pages(base_url: str, issuer_name: str) -> list:
             if not href:
                 continue
 
-            note_url = BASE_URL + href
+            note_url = BASE_URL + href if href.startswith("/") else href
             title = a.get_text(" ", strip=True)
 
             rows.append({
@@ -149,7 +163,9 @@ def scrape_note_links_all_pages(base_url: str, issuer_name: str) -> list:
 
         print(f"Found {page_rows} banknotes on page {page}")
 
-        if page_rows == 0:
+        # stop once we hit a partial final page
+        if page_rows < 50:
+            print(f"Last page reached for {issuer_name}")
             break
 
         page += 1
@@ -170,7 +186,11 @@ if __name__ == "__main__":
         rows = scrape_note_links_all_pages(banknote_url, issuer_name)
         all_rows.extend(rows)
 
-    df_notes = pd.DataFrame(all_rows).drop_duplicates(subset=["issuer_name", "note_url"]).reset_index(drop=True)
+    df_notes = (
+        pd.DataFrame(all_rows)
+        .drop_duplicates(subset=["issuer_name", "note_url"])
+        .reset_index(drop=True)
+    )
     df_notes["load_timestamp"] = datetime.now(timezone.utc)
 
     print(df_notes.head())

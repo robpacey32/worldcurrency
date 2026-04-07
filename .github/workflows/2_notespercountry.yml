@@ -2,6 +2,9 @@ name: Numista 2 Notes Per Country
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 16 * *"   # Runs at 06:00 UTC on the 15th of every month
+
 
 jobs:
   scrape-notes-per-country:
