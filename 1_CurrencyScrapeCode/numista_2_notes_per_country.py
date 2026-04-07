@@ -15,7 +15,7 @@ from google.oauth2 import service_account
 PROJECT_ID = "currency-pacey32-github"
 SOURCE_DATASET = "numistaviews"
 TARGET_DATASET = "numistascrape"
-SOURCE_TABLE = "1_Countries"
+SOURCE_TABLE = "1_Countries_Latest"
 TARGET_TABLE = "2_NotesPerCountry"
 BASE_URL = "https://en.numista.com"
 
