@@ -71,6 +71,8 @@ def get_driver() -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--lang=en-GB")
     options.add_argument(
         "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -80,25 +82,21 @@ def get_driver() -> webdriver.Chrome:
     return webdriver.Chrome(options=options)
 
 
-def get_page_html(url: str) -> str:
-    driver = get_driver()
-    try:
-        driver.get(url)
+def get_page_html(driver: webdriver.Chrome, url: str) -> str:
+    driver.get(url)
 
-        WebDriverWait(driver, 20).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
+    WebDriverWait(driver, 20).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
 
-        time.sleep(2)
+    time.sleep(2)
 
-        html = driver.page_source
+    html = driver.page_source
 
-        print("PAGE TITLE:", driver.title)
-        print("CURRENT URL:", driver.current_url)
+    print("PAGE TITLE:", driver.title)
+    print("CURRENT URL:", driver.current_url)
 
-        return html
-    finally:
-        driver.quit()
+    return html
 
 
 def build_banknote_url(country_url: str) -> str:
@@ -121,51 +119,60 @@ def set_page_number(url: str, page: int) -> str:
 def scrape_note_links_all_pages(start_url: str, issuer_name: str) -> list:
     page = 1
     rows = []
+    driver = get_driver()
 
-    while True:
-        url = set_page_number(start_url, page)
-        print(f"Scraping {issuer_name} - page {page}")
-        print(f"REQUEST URL: {url}")
+    try:
+        while True:
+            url = set_page_number(start_url, page)
+            print(f"Scraping {issuer_name} - page {page}")
+            print(f"REQUEST URL: {url}")
 
-        html = get_page_html(url)
-        soup = BeautifulSoup(html, "html.parser")
+            html = get_page_html(driver, url)
+            soup = BeautifulSoup(html, "html.parser")
 
-        blocks = soup.select("div.resultat_recherche div.description_piece")
+            if "Just a moment" in driver.title:
+                print(f"Blocked by interstitial for {issuer_name} on page {page}")
+                break
 
-        if not blocks:
-            print(f"No note blocks found for {issuer_name} on page {page}")
-            break
+            blocks = soup.select("div.resultat_recherche div.description_piece")
 
-        page_rows = 0
+            if not blocks:
+                print(f"No note blocks found for {issuer_name} on page {page}")
+                break
 
-        for block in blocks:
-            a = block.select_one("strong a")
-            if not a:
-                continue
+            page_rows = 0
 
-            href = a.get("href")
-            if not href:
-                continue
+            for block in blocks:
+                a = block.select_one("strong a")
+                if not a:
+                    continue
 
-            note_url = BASE_URL + href if href.startswith("/") else href
-            title = a.get_text(" ", strip=True)
+                href = a.get("href")
+                if not href:
+                    continue
 
-            rows.append({
-                "issuer_name": issuer_name,
-                "issuer_page": url,
-                "note_title": title,
-                "note_url": note_url
-            })
-            page_rows += 1
+                note_url = BASE_URL + href if href.startswith("/") else href
+                title = a.get_text(" ", strip=True)
 
-        print(f"Found {page_rows} banknotes on page {page}")
+                rows.append({
+                    "issuer_name": issuer_name,
+                    "issuer_page": url,
+                    "note_title": title,
+                    "note_url": note_url
+                })
+                page_rows += 1
 
-        # If fewer than 50 results returned, this is the last page
-        if page_rows < RESULTS_PER_PAGE:
-            print(f"Last page reached for {issuer_name}")
-            break
+            print(f"Found {page_rows} banknotes on page {page}")
 
-        page += 1
+            if page_rows < RESULTS_PER_PAGE:
+                print(f"Last page reached for {issuer_name}")
+                break
+
+            page += 1
+            time.sleep(3)
+
+    finally:
+        driver.quit()
 
     return rows
 
