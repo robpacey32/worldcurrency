@@ -65,7 +65,7 @@ def upload_to_bigquery(df: pd.DataFrame) -> None:
 
 def get_driver() -> webdriver.Chrome:
     options = Options()
-    options.add_argument("--headless")
+#    options.add_argument("--headless")
     options.add_argument("--window-size=1600,1400")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
