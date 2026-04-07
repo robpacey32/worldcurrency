@@ -14,8 +14,9 @@ from google.oauth2 import service_account
 
 
 PROJECT_ID = "currency-pacey32-github"
-DATASET = "numistascrape"
-SOURCE_TABLE = "2_NotesPerCountry"
+SOURCE_DATASET = "numistaviews"
+TARGET_DATASET = "numistascrape"
+SOURCE_TABLE = "2_NotesPerCountry_Latest"
 TARGET_TABLE = "3_NoteDetail"
 BATCH_SIZE = 50
 
@@ -67,7 +68,7 @@ def read_note_links_from_bigquery() -> pd.DataFrame:
         issuer_name,
         note_title,
         note_url
-      FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
+      FROM `{PROJECT_ID}.{SOURCE_DATASET}.{SOURCE_TABLE}`
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY note_url
         ORDER BY load_timestamp DESC
@@ -75,7 +76,7 @@ def read_note_links_from_bigquery() -> pd.DataFrame:
     ),
     already_done AS (
       SELECT DISTINCT `Note URL` AS note_url
-      FROM `{PROJECT_ID}.{DATASET}.{TARGET_TABLE}`
+      FROM `{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}`
       WHERE `Note URL` IS NOT NULL
     )
     SELECT l.*
@@ -94,7 +95,7 @@ def upload_to_bigquery(df: pd.DataFrame) -> None:
         return
 
     client = get_bq_client()
-    table_id = f"{PROJECT_ID}.{DATASET}.{TARGET_TABLE}"
+    table_id = f"{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}"
 
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_APPEND"

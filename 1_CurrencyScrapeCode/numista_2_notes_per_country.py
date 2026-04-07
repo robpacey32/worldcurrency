@@ -18,6 +18,7 @@ TARGET_DATASET = "numistascrape"
 SOURCE_TABLE = "1_Countries_Latest"
 TARGET_TABLE = "2_NotesPerCountry"
 BASE_URL = "https://en.numista.com"
+RESULTS_PER_PAGE = 50
 
 
 def get_bq_client() -> bigquery.Client:
@@ -43,10 +44,6 @@ def read_countries_from_bigquery() -> pd.DataFrame:
     -- TESTING
     AND name = 'Afghanistan'
     --
-    QUALIFY ROW_NUMBER() OVER (
-      PARTITION BY url
-      ORDER BY load_timestamp DESC
-    ) = 1
     """
     rows = list(client.query(query).result())
     return pd.DataFrame([dict(row.items()) for row in rows])
@@ -107,7 +104,7 @@ def get_page_html(url: str) -> str:
 def build_banknote_url(country_url: str) -> str:
     slug = country_url.split("/")[-1].replace("-1.html", "")
     return (
-        f"https://en.numista.com/catalogue/index.php"
+        f"{BASE_URL}/catalogue/index.php"
         f"?e={slug}"
         f"&r=&st=148&cat=y"
         f"&im1=&im2=&ru=&ie=&no=&v=&cu=&a=&dg=&i=&b=&m=&f=&t=&t2=&w=&mt=&u=&g="
@@ -163,8 +160,8 @@ def scrape_note_links_all_pages(start_url: str, issuer_name: str) -> list:
 
         print(f"Found {page_rows} banknotes on page {page}")
 
-        # stop once we hit a partial final page
-        if page_rows < 50:
+        # If fewer than 50 results returned, this is the last page
+        if page_rows < RESULTS_PER_PAGE:
             print(f"Last page reached for {issuer_name}")
             break
 
@@ -186,14 +183,17 @@ if __name__ == "__main__":
         rows = scrape_note_links_all_pages(banknote_url, issuer_name)
         all_rows.extend(rows)
 
-    df_notes = (
-        pd.DataFrame(all_rows)
-        .drop_duplicates(subset=["issuer_name", "note_url"])
-        .reset_index(drop=True)
-    )
-    df_notes["load_timestamp"] = datetime.now(timezone.utc)
+    if not all_rows:
+        print("No notes scraped.")
+    else:
+        df_notes = (
+            pd.DataFrame(all_rows)
+            .drop_duplicates(subset=["issuer_name", "note_url"])
+            .reset_index(drop=True)
+        )
+        df_notes["load_timestamp"] = datetime.now(timezone.utc)
 
-    print(df_notes.head())
-    print("Total notes scraped:", len(df_notes))
+        print(df_notes.head())
+        print("Total notes scraped:", len(df_notes))
 
-    upload_to_bigquery(df_notes)
+        upload_to_bigquery(df_notes)
