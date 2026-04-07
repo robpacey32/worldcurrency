@@ -12,9 +12,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-
 PROJECT_ID = "currency-pacey32-github"
-DATASET = "numistascrape"
+SOURCE_DATASET = "numistaviews"
+TARGET_DATASET = "numistascrape"
 SOURCE_TABLE = "1_Countries"
 TARGET_TABLE = "2_NotesPerCountry"
 BASE_URL = "https://en.numista.com"
@@ -38,7 +38,7 @@ def read_countries_from_bigquery() -> pd.DataFrame:
       path,
       depth,
       li_classes
-    FROM `{PROJECT_ID}.{DATASET}.{SOURCE_TABLE}`
+    FROM `{PROJECT_ID}.{SOURCE_DATASET}.{SOURCE_TABLE}`
     WHERE name = path
     -- TESTING
     AND name = 'Afghanistan'
@@ -54,7 +54,7 @@ def read_countries_from_bigquery() -> pd.DataFrame:
 
 def upload_to_bigquery(df: pd.DataFrame) -> None:
     client = get_bq_client()
-    table_id = f"{PROJECT_ID}.{DATASET}.{TARGET_TABLE}"
+    table_id = f"{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}"
 
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_APPEND"
