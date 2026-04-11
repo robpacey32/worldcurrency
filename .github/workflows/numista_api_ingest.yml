@@ -32,4 +32,4 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: key.json
           NUMISTA_API_KEYS: ${{ secrets.NUMISTA_API_KEYS }}
         run: |
-          python 1_CurrencyScrapeCode/numista_api_ingest.py
+          python API_DataPull/numista_api_ingest.py
