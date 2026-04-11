@@ -7,6 +7,7 @@ import time
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 from google.cloud import bigquery
@@ -18,32 +19,30 @@ TARGET_DATASET = "numistascrape"
 SOURCE_TABLE = "1_Countries_Latest"
 TARGET_TABLE = "2_NotesPerCountry"
 BASE_URL = "https://en.numista.com"
-RESULTS_PER_PAGE = 50
 
 
 def get_bq_client() -> bigquery.Client:
-    json_str = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
-    info = json.loads(json_str)
-    credentials = service_account.Credentials.from_service_account_info(info)
-    return bigquery.Client(project=PROJECT_ID, credentials=credentials)
+    json_str = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if json_str:
+        info = json.loads(json_str)
+        credentials = service_account.Credentials.from_service_account_info(info)
+        return bigquery.Client(project=PROJECT_ID, credentials=credentials)
+
+    key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if key_path:
+        credentials = service_account.Credentials.from_service_account_file(key_path)
+        return bigquery.Client(project=PROJECT_ID, credentials=credentials)
+
+    raise ValueError("Set credentials env var")
 
 
 def read_countries_from_bigquery() -> pd.DataFrame:
     client = get_bq_client()
     query = f"""
-    SELECT
-      name,
-      url,
-      relative_url,
-      alt_names,
-      path,
-      depth,
-      li_classes
+    SELECT *
     FROM `{PROJECT_ID}.{SOURCE_DATASET}.{SOURCE_TABLE}`
     WHERE name = path
-    -- TESTING
     AND name = 'Afghanistan'
-    --
     """
     rows = list(client.query(query).result())
     return pd.DataFrame([dict(row.items()) for row in rows])
@@ -53,11 +52,11 @@ def upload_to_bigquery(df: pd.DataFrame) -> None:
     client = get_bq_client()
     table_id = f"{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}"
 
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND"
+    job = client.load_table_from_dataframe(
+        df,
+        table_id,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
     )
-
-    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
     job.result()
 
     print(f"Loaded {len(df)} rows to {table_id}")
@@ -65,7 +64,7 @@ def upload_to_bigquery(df: pd.DataFrame) -> None:
 
 def get_driver() -> webdriver.Chrome:
     options = Options()
-#    options.add_argument("--headless")
+    options.add_argument("--headless")
     options.add_argument("--window-size=1600,1400")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -78,103 +77,100 @@ def get_driver() -> webdriver.Chrome:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/123.0.0.0 Safari/537.36"
     )
-
     return webdriver.Chrome(options=options)
 
 
-def get_page_html(driver: webdriver.Chrome, url: str) -> str:
-    driver.get(url)
+def wait_for_real_content(driver):
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.resultat_recherche div.description_piece")) > 0
+        )
+    except:
+        print("Content not found (likely blocked)")
 
-    WebDriverWait(driver, 20).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
 
-    time.sleep(2)
+def get_page_html(driver, url):
+    for attempt in range(3):
+        driver.get(url)
 
-    html = driver.page_source
+        wait_for_real_content(driver)
+        time.sleep(2)
+
+        if "Just a moment" not in driver.title:
+            break
+
+        print(f"Blocked - retry {attempt+1}")
+        time.sleep(5)
 
     print("PAGE TITLE:", driver.title)
     print("CURRENT URL:", driver.current_url)
 
-    return html
+    return driver.page_source
 
 
 def build_banknote_url(country_url: str) -> str:
-    slug = country_url.split("/")[-1].replace("-1.html", "")
+    slug = country_url.rstrip("/").split("/")[-1].replace("-1.html", "")
+
+    if not slug.endswith("_section"):
+        slug = f"{slug}_section"
+
     return (
         f"{BASE_URL}/catalogue/index.php"
         f"?e={slug}"
         f"&r=&st=148&cat=y"
         f"&im1=&im2=&ru=&ie=&no=&v=&cu=&a=&dg=&i=&b=&m=&f=&t=&t2=&w=&mt=&u=&g="
+        f"&ps=200"
         f"&p=1"
+        f"&q=200"
     )
 
 
-def set_page_number(url: str, page: int) -> str:
-    if "&p=" in url:
-        return url.rsplit("&p=", 1)[0] + f"&p={page}"
-    return url + f"&p={page}"
-
-
-def scrape_note_links_all_pages(start_url: str, issuer_name: str) -> list:
-    page = 1
-    rows = []
+def scrape_note_links_one_page(url: str, issuer_name: str) -> list:
     driver = get_driver()
 
     try:
-        while True:
-            url = set_page_number(start_url, page)
-            print(f"Scraping {issuer_name} - page {page}")
-            print(f"REQUEST URL: {url}")
+        print(f"Scraping {issuer_name}")
+        print(f"REQUEST URL: {url}")
 
-            html = get_page_html(driver, url)
-            soup = BeautifulSoup(html, "html.parser")
+        html = get_page_html(driver, url)
 
-            if "Just a moment" in driver.title:
-                print(f"Blocked by interstitial for {issuer_name} on page {page}")
-                break
+        if "Just a moment" in driver.title:
+            print(f"Still blocked for {issuer_name}")
+            return []
 
-            blocks = soup.select("div.resultat_recherche div.description_piece")
+        soup = BeautifulSoup(html, "html.parser")
+        blocks = soup.select("div.resultat_recherche div.description_piece")
 
-            if not blocks:
-                print(f"No note blocks found for {issuer_name} on page {page}")
-                break
+        if not blocks:
+            print(f"No note blocks found for {issuer_name}")
+            return []
 
-            page_rows = 0
+        rows = []
 
-            for block in blocks:
-                a = block.select_one("strong a")
-                if not a:
-                    continue
+        for block in blocks:
+            a = block.select_one("strong a")
+            if not a:
+                continue
 
-                href = a.get("href")
-                if not href:
-                    continue
+            href = a.get("href")
+            if not href:
+                continue
 
-                note_url = BASE_URL + href if href.startswith("/") else href
-                title = a.get_text(" ", strip=True)
+            note_url = BASE_URL + href if href.startswith("/") else href
+            title = a.get_text(" ", strip=True)
 
-                rows.append({
-                    "issuer_name": issuer_name,
-                    "issuer_page": url,
-                    "note_title": title,
-                    "note_url": note_url
-                })
-                page_rows += 1
+            rows.append({
+                "issuer_name": issuer_name,
+                "issuer_page": driver.current_url,
+                "note_title": title,
+                "note_url": note_url
+            })
 
-            print(f"Found {page_rows} banknotes on page {page}")
-
-            if page_rows < RESULTS_PER_PAGE:
-                print(f"Last page reached for {issuer_name}")
-                break
-
-            page += 1
-            time.sleep(3)
+        print(f"Found {len(rows)} banknotes for {issuer_name}")
+        return rows
 
     finally:
         driver.quit()
-
-    return rows
 
 
 if __name__ == "__main__":
@@ -183,11 +179,13 @@ if __name__ == "__main__":
     all_rows = []
 
     for _, row in df_issuers.iterrows():
+        time.sleep(5)  # slow down between countries
+
         issuer_name = row["name"]
         issuer_url = row["url"]
 
         banknote_url = build_banknote_url(issuer_url)
-        rows = scrape_note_links_all_pages(banknote_url, issuer_name)
+        rows = scrape_note_links_one_page(banknote_url, issuer_name)
         all_rows.extend(rows)
 
     if not all_rows:

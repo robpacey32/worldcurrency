@@ -1,9 +1,6 @@
+requests
 pandas
-beautifulsoup4
-selenium
 google-cloud-bigquery
+google-auth
 pyarrow
 db-dtypes
-lxml
-google-cloud-bigquery-storage
-pandas-gbq>=0.26.1
