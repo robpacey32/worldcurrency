@@ -295,19 +295,26 @@ def fetch_type_detail(
 # BIGQUERY HELPERS
 # =========================
 def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
-    return client.query(sql).to_dataframe()
-
+    try:
+        job = client.query(sql)
+        return job.to_dataframe()
+    except Exception:
+        logging.exception("BigQuery query failed.\nSQL:\n%s", sql)
+        raise
 
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
-    SELECT DISTINCT Country AS issuer_name
+    SELECT DISTINCT CAST(name AS STRING) AS issuer_name
     FROM `{COUNTRIES_SOURCE}`
-    WHERE Country IS NOT NULL
-      AND TRIM(Country) != ''
-    ORDER BY Country
+    WHERE name IS NOT NULL
+      AND TRIM(CAST(name AS STRING)) != ''
+    ORDER BY issuer_name
     """
+
     df = run_query_df(client, sql)
     issuers = df["issuer_name"].tolist()
+
+    logging.info("Loaded %s issuers from %s", len(issuers), COUNTRIES_SOURCE)
 
     if TEST_ISSUERS:
         test_set = {x.strip().lower() for x in TEST_ISSUERS}
