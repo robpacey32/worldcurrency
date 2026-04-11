@@ -3,7 +3,7 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 import pandas as pd
 import requests
@@ -24,11 +24,11 @@ DETAIL_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_type_detail"
 NUMISTA_BASE_URL = "https://api.numista.com/v3"
 NUMISTA_CATEGORY = "banknote"
 NUMISTA_LANG = "en"
-SEARCH_PAGE_SIZE = 50   # verified in official example
-SLEEP_SECONDS = 0.4     # small pause between calls
+SEARCH_PAGE_SIZE = 50
+SLEEP_SECONDS = 0.4
 REQUEST_TIMEOUT = 60
 
-# Hard stop to protect your free quota
+# Hard stops to protect quota usage per run
 MAX_SEARCH_REQUESTS_PER_RUN = 250
 MAX_DETAIL_REQUESTS_PER_RUN = 1000
 
@@ -37,10 +37,66 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+TEST_ISSUERS = ["Slovakia"]   # set to [] to run all issuers
+MAX_NEW_TYPE_IDS_FOR_TEST = 10  # None for no limit
 
 # =========================
 # AUTH / CLIENTS
 # =========================
+class APIKeyManager:
+    def __init__(self, keys: List[str]):
+        cleaned_keys = [k.strip() for k in keys if k and k.strip()]
+        if not cleaned_keys:
+            raise ValueError("No API keys provided.")
+
+        self.keys = cleaned_keys
+        self.index = 0
+        self.exhausted_keys: Set[str] = set()
+
+    def get_current_key(self) -> str:
+        return self.keys[self.index]
+
+    def get_current_headers(self) -> Dict[str, str]:
+        return {
+            "Numista-API-Key": self.get_current_key(),
+            "Accept": "application/json",
+            "User-Agent": "pacey32-numista-loader/1.0",
+        }
+
+    def mark_current_key_failed(self, reason: str) -> None:
+        failed_key = self.get_current_key()
+        self.exhausted_keys.add(failed_key)
+
+        masked_key = f"{failed_key[:4]}..." if len(failed_key) >= 4 else "***"
+        logging.warning("Marking current API key as failed (%s): %s", reason, masked_key)
+
+        remaining_indices = [
+            i for i, key in enumerate(self.keys) if key not in self.exhausted_keys
+        ]
+
+        if not remaining_indices:
+            raise RuntimeError("All Numista API keys exhausted.")
+
+        self.index = remaining_indices[0]
+        next_key = self.get_current_key()
+        masked_next = f"{next_key[:4]}..." if len(next_key) >= 4 else "***"
+        logging.info(
+            "Switched to next Numista API key: %s (%s remaining)",
+            masked_next,
+            len(remaining_indices),
+        )
+
+    def get_active_key_count(self) -> int:
+        return len([k for k in self.keys if k not in self.exhausted_keys])
+
+
+def get_api_keys() -> List[str]:
+    keys_str = os.environ.get("NUMISTA_API_KEYS")
+    if not keys_str:
+        raise ValueError("NUMISTA_API_KEYS environment variable is missing.")
+    return [k.strip() for k in keys_str.split(",") if k.strip()]
+
+
 def get_bq_client() -> bigquery.Client:
     json_str = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if json_str:
@@ -53,17 +109,6 @@ def get_bq_client() -> bigquery.Client:
         return bigquery.Client.from_service_account_json(creds_path)
 
     return bigquery.Client(project=PROJECT_ID)
-
-
-def get_numista_headers() -> Dict[str, str]:
-    api_key = os.environ.get("NUMISTA_API_KEY")
-    if not api_key:
-        raise ValueError("NUMISTA_API_KEY environment variable is missing.")
-    return {
-        "Numista-API-Key": api_key,
-        "Accept": "application/json",
-        "User-Agent": "pacey32-numista-loader/1.0"
-    }
 
 
 # =========================
@@ -109,36 +154,57 @@ def ensure_tables_exist(client: bigquery.Client) -> None:
 def numista_get(
     path: str,
     params: Dict[str, Any],
-    headers: Dict[str, str],
+    key_manager: APIKeyManager,
+    session: Optional[requests.Session] = None,
 ) -> Dict[str, Any]:
     url = f"{NUMISTA_BASE_URL}{path}"
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
-    )
+    requester = session or requests
 
-    if response.status_code == 429:
-        raise RuntimeError("Numista API rate/quota limit hit (HTTP 429).")
-    response.raise_for_status()
-    return response.json()
+    while True:
+        headers = key_manager.get_current_headers()
+
+        try:
+            response = requester.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 429:
+                key_manager.mark_current_key_failed("HTTP 429 rate/quota limit")
+                continue
+
+            if response.status_code in (401, 403):
+                key_manager.mark_current_key_failed(f"HTTP {response.status_code} auth/quota error")
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+
+            if status_code in (401, 403, 429):
+                key_manager.mark_current_key_failed(f"HTTP {status_code}")
+                continue
+
+            raise
+
+        except requests.exceptions.RequestException as exc:
+            logging.warning("Transient request error: %s", exc)
+            raise
 
 
 def build_search_query(issuer_name: str) -> str:
-    """
-    Conservative version:
-    Use issuer/country name as the text query because that pattern is verified
-    from the official example using q=... on /types.
-    If you later confirm a dedicated issuer filter in the docs, replace this.
-    """
     return issuer_name.strip()
 
 
 def search_type_ids_for_issuer(
     issuer_name: str,
-    headers: Dict[str, str],
+    key_manager: APIKeyManager,
     max_search_requests_remaining: int,
+    session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
     all_rows: List[Dict[str, Any]] = []
     page = 1
@@ -161,7 +227,12 @@ def search_type_ids_for_issuer(
             "lang": NUMISTA_LANG,
         }
 
-        data = numista_get("/types", params=params, headers=headers)
+        data = numista_get(
+            path="/types",
+            params=params,
+            key_manager=key_manager,
+            session=session,
+        )
         search_requests_used += 1
 
         results = data.get("types") or data.get("results") or []
@@ -186,10 +257,11 @@ def search_type_ids_for_issuer(
 
         logging.info(
             "Search issuer=%s page=%s returned %s rows",
-            issuer_name, page, len(results)
+            issuer_name,
+            page,
+            len(results),
         )
 
-        # stop when final page is reached
         if len(results) < SEARCH_PAGE_SIZE:
             break
 
@@ -201,13 +273,16 @@ def search_type_ids_for_issuer(
 
 def fetch_type_detail(
     type_id: int,
-    headers: Dict[str, str],
+    key_manager: APIKeyManager,
+    session: Optional[requests.Session] = None,
 ) -> Dict[str, Any]:
     data = numista_get(
         path=f"/types/{type_id}",
         params={},
-        headers=headers,
+        key_manager=key_manager,
+        session=session,
     )
+
     return {
         "type_id": int(type_id),
         "category": NUMISTA_CATEGORY,
@@ -232,19 +307,29 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     ORDER BY Country
     """
     df = run_query_df(client, sql)
-    return df["issuer_name"].tolist()
+    issuers = df["issuer_name"].tolist()
+
+    if TEST_ISSUERS:
+        test_set = {x.strip().lower() for x in TEST_ISSUERS}
+        issuers = [x for x in issuers if x.strip().lower() in test_set]
+        logging.info("TEST MODE: restricting issuers to %s", issuers)
+
+    return issuers
 
 
 def get_existing_detail_ids(client: bigquery.Client) -> Set[int]:
-    sql = f"""
-    SELECT DISTINCT type_id
-    FROM `{DETAIL_RAW_TABLE}`
-    WHERE type_id IS NOT NULL
-    """
-    df = run_query_df(client, sql)
-    if df.empty:
+    try:
+        sql = f"""
+        SELECT DISTINCT type_id
+        FROM `{DETAIL_RAW_TABLE}`
+        WHERE type_id IS NOT NULL
+        """
+        df = run_query_df(client, sql)
+        if df.empty:
+            return set()
+        return set(df["type_id"].astype(int).tolist())
+    except Exception:
         return set()
-    return set(df["type_id"].astype(int).tolist())
 
 
 def append_json_rows(
@@ -253,10 +338,12 @@ def append_json_rows(
     rows: List[Dict[str, Any]],
 ) -> None:
     if not rows:
+        logging.info("No rows to insert into %s", table_id)
         return
 
     load_ts = datetime.now(timezone.utc).isoformat()
     final_rows = []
+
     for row in rows:
         row_copy = dict(row)
         row_copy["load_timestamp"] = load_ts
@@ -274,7 +361,10 @@ def append_json_rows(
 # =========================
 def main() -> None:
     client = get_bq_client()
-    headers = get_numista_headers()
+    api_keys = get_api_keys()
+    key_manager = APIKeyManager(api_keys)
+
+    logging.info("Loaded %s Numista API keys", len(api_keys))
 
     ensure_tables_exist(client)
 
@@ -290,61 +380,84 @@ def main() -> None:
     all_search_rows: List[Dict[str, Any]] = []
     new_type_ids: Set[int] = set()
 
-    for issuer_name in issuers:
-        remaining_search = MAX_SEARCH_REQUESTS_PER_RUN - search_requests_used
-        if remaining_search <= 0:
-            logging.warning("Search guardrail reached for this run.")
-            break
+    with requests.Session() as session:
+        for issuer_name in issuers:
+            remaining_search = MAX_SEARCH_REQUESTS_PER_RUN - search_requests_used
+            if remaining_search <= 0:
+                logging.warning("Search guardrail reached for this run.")
+                break
 
-        issuer_rows = search_type_ids_for_issuer(
-            issuer_name=issuer_name,
-            headers=headers,
-            max_search_requests_remaining=remaining_search,
-        )
+            try:
+                issuer_rows = search_type_ids_for_issuer(
+                    issuer_name=issuer_name,
+                    key_manager=key_manager,
+                    max_search_requests_remaining=remaining_search,
+                    session=session,
+                )
+            except Exception as exc:
+                logging.exception("Failed search for issuer %s: %s", issuer_name, exc)
+                continue
 
-        # approximate usage by distinct pages found
-        issuer_pages_used = len(set(
-            (r["issuer_name"], r["page_number"]) for r in issuer_rows
-        ))
-        search_requests_used += issuer_pages_used
+            issuer_pages_used = len({
+                (r["issuer_name"], r["page_number"]) for r in issuer_rows
+            })
+            search_requests_used += issuer_pages_used
 
-        all_search_rows.extend(issuer_rows)
+            all_search_rows.extend(issuer_rows)
 
-        for row in issuer_rows:
-            type_id = row["type_id"]
-            if type_id not in existing_detail_ids:
-                new_type_ids.add(type_id)
+            for row in issuer_rows:
+                type_id = row["type_id"]
+                if type_id not in existing_detail_ids:
+                    new_type_ids.add(type_id)
 
-        time.sleep(SLEEP_SECONDS)
+            time.sleep(SLEEP_SECONDS)
 
-    append_json_rows(client, SEARCH_RAW_TABLE, all_search_rows)
+        append_json_rows(client, SEARCH_RAW_TABLE, all_search_rows)
 
-    logging.info("Discovered %s new type IDs to fetch", len(new_type_ids))
+        if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
+            new_type_ids = set(sorted(new_type_ids)[:MAX_NEW_TYPE_IDS_FOR_TEST])
+            logging.info(
+                "TEST MODE: limiting new type IDs to first %s",
+                MAX_NEW_TYPE_IDS_FOR_TEST
+            )
 
-    detail_rows: List[Dict[str, Any]] = []
-    for idx, type_id in enumerate(sorted(new_type_ids), start=1):
-        if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN:
-            logging.warning("Detail guardrail reached for this run.")
-            break
+        logging.info("Discovered %s new type IDs to fetch", len(new_type_ids))
 
-        logging.info("[%s/%s] Fetching detail for type_id=%s", idx, len(new_type_ids), type_id)
+        detail_rows: List[Dict[str, Any]] = []
 
-        try:
-            detail_row = fetch_type_detail(type_id=type_id, headers=headers)
-            detail_rows.append(detail_row)
-            detail_requests_used += 1
-        except Exception as exc:
-            logging.exception("Failed detail fetch for %s: %s", type_id, exc)
+        for idx, type_id in enumerate(sorted(new_type_ids), start=1):
+            if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN:
+                logging.warning("Detail guardrail reached for this run.")
+                break
 
-        time.sleep(SLEEP_SECONDS)
+            logging.info(
+                "[%s/%s] Fetching detail for type_id=%s",
+                idx,
+                len(new_type_ids),
+                type_id,
+            )
 
-    append_json_rows(client, DETAIL_RAW_TABLE, detail_rows)
+            try:
+                detail_row = fetch_type_detail(
+                    type_id=type_id,
+                    key_manager=key_manager,
+                    session=session,
+                )
+                detail_rows.append(detail_row)
+                detail_requests_used += 1
+            except Exception as exc:
+                logging.exception("Failed detail fetch for %s: %s", type_id, exc)
+
+            time.sleep(SLEEP_SECONDS)
+
+        append_json_rows(client, DETAIL_RAW_TABLE, detail_rows)
 
     logging.info("Run complete.")
     logging.info("Search requests used: %s", search_requests_used)
     logging.info("Detail requests used: %s", detail_requests_used)
     logging.info("Search rows written: %s", len(all_search_rows))
     logging.info("Detail rows written: %s", len(detail_rows))
+    logging.info("Active API keys remaining at end of run: %s", key_manager.get_active_key_count())
 
 
 if __name__ == "__main__":
