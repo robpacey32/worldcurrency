@@ -17,8 +17,9 @@ from google.oauth2 import service_account
 # =========================
 PROJECT_ID = "currency-pacey32-github"
 DATASET_ID = "numistascrape"
+DATASET_ID_VIEW = "numistaviews"
 
-COUNTRIES_SOURCE = f"{PROJECT_ID}.{DATASET_ID}.1_Countries"
+COUNTRIES_SOURCE = f"{PROJECT_ID}.{DATASET_ID_VIEW}.1_Countries_Latest"
 SEARCH_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_search_results"
 DETAIL_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_type_detail"
 
