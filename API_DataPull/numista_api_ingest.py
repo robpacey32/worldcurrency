@@ -22,6 +22,7 @@ DATASET_ID_VIEW = "numistaviews"
 COUNTRIES_SOURCE = f"{PROJECT_ID}.{DATASET_ID_VIEW}.1_Countries_Latest"
 SEARCH_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_search_results"
 DETAIL_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_type_detail"
+PROGRESS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_api_progress"
 
 NUMISTA_BASE_URL = "https://api.numista.com/v3"
 NUMISTA_CATEGORY = "banknote"
@@ -33,7 +34,7 @@ REQUEST_TIMEOUT = 60
 MAX_SEARCH_REQUESTS_PER_RUN = 250
 MAX_DETAIL_REQUESTS_PER_RUN = 1000
 
-TEST_ISSUERS = ["Slovakia"]   # set to [] to run all issuers
+TEST_ISSUERS = []   # set to [] to run all issuers
 MAX_NEW_TYPE_IDS_FOR_TEST = None  # None for no limit
 
 logging.basicConfig(
@@ -171,9 +172,21 @@ def ensure_tables_exist(client: bigquery.Client) -> None:
         bigquery.SchemaField("raw_detail_json", "JSON"),
     ]
 
+    progress_schema = [
+        bigquery.SchemaField("run_id", "STRING"),
+        bigquery.SchemaField("issuer_name", "STRING"),
+        bigquery.SchemaField("stage", "STRING"),
+        bigquery.SchemaField("status", "STRING"),
+        bigquery.SchemaField("search_rows_written", "INT64"),
+        bigquery.SchemaField("detail_rows_written", "INT64"),
+        bigquery.SchemaField("message", "STRING"),
+        bigquery.SchemaField("load_timestamp", "TIMESTAMP"),
+    ]
+
     for table_id, schema in [
         (SEARCH_RAW_TABLE, search_schema),
         (DETAIL_RAW_TABLE, detail_schema),
+        (PROGRESS_TABLE, progress_schema),
     ]:
         try:
             client.get_table(table_id)
@@ -215,7 +228,9 @@ def numista_get(
                 continue
 
             if response.status_code in (401, 403):
-                key_manager.mark_current_key_failed(f"HTTP {response.status_code} auth/quota error")
+                key_manager.mark_current_key_failed(
+                    f"HTTP {response.status_code} auth/quota error"
+                )
                 continue
 
             response.raise_for_status()
@@ -430,6 +445,23 @@ def get_existing_detail_ids(client: bigquery.Client) -> Set[int]:
         return set()
 
 
+def get_completed_issuers(client: bigquery.Client) -> Set[str]:
+    try:
+        sql = f"""
+        SELECT DISTINCT issuer_name
+        FROM `{PROGRESS_TABLE}`
+        WHERE stage = 'issuer_detail_complete'
+          AND status = 'SUCCESS'
+          AND issuer_name IS NOT NULL
+        """
+        df = run_query_df(client, sql)
+        if df.empty:
+            return set()
+        return set(df["issuer_name"].astype(str).tolist())
+    except Exception:
+        return set()
+
+
 def append_json_rows(
     client: bigquery.Client,
     table_id: str,
@@ -458,6 +490,41 @@ def append_json_rows(
     logging.info("Inserted %s rows into %s", len(final_rows), table_id)
 
 
+def append_progress_row(
+    client: bigquery.Client,
+    run_id: str,
+    issuer_name: str,
+    stage: str,
+    status: str,
+    search_rows_written: Optional[int] = None,
+    detail_rows_written: Optional[int] = None,
+    message: Optional[str] = None,
+) -> None:
+    row = [{
+        "run_id": run_id,
+        "issuer_name": issuer_name,
+        "stage": stage,
+        "status": status,
+        "search_rows_written": search_rows_written,
+        "detail_rows_written": detail_rows_written,
+        "message": message,
+        "load_timestamp": datetime.now(timezone.utc).isoformat(),
+    }]
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND
+    )
+    job = client.load_table_from_json(row, PROGRESS_TABLE, job_config=job_config)
+    job.result()
+
+    logging.info(
+        "Progress logged | issuer=%s | stage=%s | status=%s",
+        issuer_name,
+        stage,
+        status,
+    )
+
+
 # =========================
 # MAIN
 # =========================
@@ -474,15 +541,23 @@ def main() -> None:
     ensure_tables_exist(client)
 
     issuers = get_issuers_to_search(client)
+    completed_issuers = get_completed_issuers(client)
     existing_detail_ids = get_existing_detail_ids(client)
 
+    if completed_issuers:
+        issuers = [x for x in issuers if x not in completed_issuers]
+        logging.info(
+            "Skipping %s issuers already completed in prior runs",
+            len(completed_issuers),
+        )
+
+    logging.info("Issuers remaining to process this run: %s", len(issuers))
     logging.info("Already have %s type details stored", len(existing_detail_ids))
 
     search_requests_used = 0
     detail_requests_used = 0
-
-    all_search_rows: List[Dict[str, Any]] = []
-    new_type_ids: Set[int] = set()
+    total_search_rows_written = 0
+    total_detail_rows_written = 0
 
     with requests.Session() as session:
         for issuer_name in issuers:
@@ -491,78 +566,161 @@ def main() -> None:
                 logging.warning("Search guardrail reached for this run.")
                 break
 
+            issuer_rows: List[Dict[str, Any]] = []
+            issuer_type_ids: Set[int] = set()
+            issuer_detail_rows: List[Dict[str, Any]] = []
+
             try:
+                logging.info("Starting issuer: %s", issuer_name)
+
                 issuer_rows = search_type_ids_for_issuer(
                     issuer_name=issuer_name,
                     key_manager=key_manager,
                     max_search_requests_remaining=remaining_search,
                     session=session,
                 )
+
+                issuer_pages_used = len({
+                    (r["issuer_name"], r["page_number"]) for r in issuer_rows
+                })
+                search_requests_used += issuer_pages_used
+
+                append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
+                total_search_rows_written += len(issuer_rows)
+
+                append_progress_row(
+                    client=client,
+                    run_id=run_id,
+                    issuer_name=issuer_name,
+                    stage="issuer_search_complete",
+                    status="SUCCESS",
+                    search_rows_written=len(issuer_rows),
+                    detail_rows_written=0,
+                    message="Search rows written successfully",
+                )
+
+                for row in issuer_rows:
+                    type_id = row["type_id"]
+                    matched = row.get("matched_on_issuer_name", False)
+                    if matched and type_id not in existing_detail_ids:
+                        issuer_type_ids.add(type_id)
+
+                if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
+                    issuer_type_ids = set(sorted(issuer_type_ids)[:MAX_NEW_TYPE_IDS_FOR_TEST])
+                    logging.info(
+                        "TEST MODE: limiting issuer=%s new type IDs to first %s",
+                        issuer_name,
+                        MAX_NEW_TYPE_IDS_FOR_TEST,
+                    )
+
+                logging.info(
+                    "Issuer=%s has %s new matched type IDs to fetch",
+                    issuer_name,
+                    len(issuer_type_ids),
+                )
+
+                for idx, type_id in enumerate(sorted(issuer_type_ids), start=1):
+                    if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN:
+                        logging.warning("Detail guardrail reached for this run.")
+                        break
+
+                    logging.info(
+                        "[%s | %s/%s] Fetching detail for type_id=%s",
+                        issuer_name,
+                        idx,
+                        len(issuer_type_ids),
+                        type_id,
+                    )
+
+                    detail_row = fetch_type_detail(
+                        type_id=type_id,
+                        key_manager=key_manager,
+                        session=session,
+                    )
+                    issuer_detail_rows.append(detail_row)
+                    detail_requests_used += 1
+                    time.sleep(SLEEP_SECONDS)
+
+                append_json_rows(client, DETAIL_RAW_TABLE, issuer_detail_rows, run_id=run_id)
+                total_detail_rows_written += len(issuer_detail_rows)
+
+                existing_detail_ids.update(
+                    {row["type_id"] for row in issuer_detail_rows}
+                )
+
+                if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN and issuer_type_ids:
+                    remaining_ids = len(issuer_type_ids) - len(issuer_detail_rows)
+                    if remaining_ids > 0:
+                        append_progress_row(
+                            client=client,
+                            run_id=run_id,
+                            issuer_name=issuer_name,
+                            stage="issuer_detail_complete",
+                            status="FAILED",
+                            search_rows_written=len(issuer_rows),
+                            detail_rows_written=len(issuer_detail_rows),
+                            message=(
+                                f"Detail guardrail reached before issuer completed. "
+                                f"{remaining_ids} type IDs remaining."
+                            ),
+                        )
+                        logging.warning(
+                            "Issuer=%s not fully completed due to detail guardrail",
+                            issuer_name,
+                        )
+                        break
+
+                append_progress_row(
+                    client=client,
+                    run_id=run_id,
+                    issuer_name=issuer_name,
+                    stage="issuer_detail_complete",
+                    status="SUCCESS",
+                    search_rows_written=len(issuer_rows),
+                    detail_rows_written=len(issuer_detail_rows),
+                    message="Issuer completed successfully",
+                )
+
+                logging.info(
+                    "Completed issuer=%s | search rows=%s | detail rows=%s",
+                    issuer_name,
+                    len(issuer_rows),
+                    len(issuer_detail_rows),
+                )
+
             except Exception as exc:
-                logging.exception("Failed search for issuer %s: %s", issuer_name, exc)
+                logging.exception("Failed issuer %s: %s", issuer_name, exc)
+
+                try:
+                    append_progress_row(
+                        client=client,
+                        run_id=run_id,
+                        issuer_name=issuer_name,
+                        stage="issuer_detail_complete",
+                        status="FAILED",
+                        search_rows_written=len(issuer_rows),
+                        detail_rows_written=len(issuer_detail_rows),
+                        message=str(exc),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Failed to write progress row for issuer=%s after error",
+                        issuer_name,
+                    )
+
                 continue
 
-            issuer_pages_used = len({
-                (r["issuer_name"], r["page_number"]) for r in issuer_rows
-            })
-            search_requests_used += issuer_pages_used
-
-            all_search_rows.extend(issuer_rows)
-
-            for row in issuer_rows:
-                type_id = row["type_id"]
-                matched = row.get("matched_on_issuer_name", False)
-                if matched:
-                    new_type_ids.add(type_id)
-
             time.sleep(SLEEP_SECONDS)
-
-        append_json_rows(client, SEARCH_RAW_TABLE, all_search_rows, run_id=run_id)
-
-        if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
-            new_type_ids = set(sorted(new_type_ids)[:MAX_NEW_TYPE_IDS_FOR_TEST])
-            logging.info(
-                "TEST MODE: limiting new type IDs to first %s",
-                MAX_NEW_TYPE_IDS_FOR_TEST
-            )
-
-        logging.info("Discovered %s candidate type IDs to fetch", len(new_type_ids))
-
-        detail_rows: List[Dict[str, Any]] = []
-
-        for idx, type_id in enumerate(sorted(new_type_ids), start=1):
-            if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN:
-                logging.warning("Detail guardrail reached for this run.")
-                break
-
-            logging.info(
-                "[%s/%s] Fetching detail for type_id=%s",
-                idx,
-                len(new_type_ids),
-                type_id,
-            )
-
-            try:
-                detail_row = fetch_type_detail(
-                    type_id=type_id,
-                    key_manager=key_manager,
-                    session=session,
-                )
-                detail_rows.append(detail_row)
-                detail_requests_used += 1
-            except Exception as exc:
-                logging.exception("Failed detail fetch for %s: %s", type_id, exc)
-
-            time.sleep(SLEEP_SECONDS)
-
-        append_json_rows(client, DETAIL_RAW_TABLE, detail_rows, run_id=run_id)
 
     logging.info("Run complete.")
     logging.info("Search requests used: %s", search_requests_used)
     logging.info("Detail requests used: %s", detail_requests_used)
-    logging.info("Search rows written: %s", len(all_search_rows))
-    logging.info("Detail rows written: %s", len(detail_rows))
-    logging.info("Active API keys remaining at end of run: %s", key_manager.get_active_key_count())
+    logging.info("Search rows written: %s", total_search_rows_written)
+    logging.info("Detail rows written: %s", total_detail_rows_written)
+    logging.info(
+        "Active API keys remaining at end of run: %s",
+        key_manager.get_active_key_count(),
+    )
 
 
 if __name__ == "__main__":
