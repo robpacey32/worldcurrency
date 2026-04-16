@@ -33,7 +33,7 @@ MAX_SEARCH_REQUESTS_PER_RUN = 250
 MAX_DETAIL_REQUESTS_PER_RUN = 1000
 
 TEST_ISSUERS = ["Slovakia"]   # set to [] to run all issuers
-MAX_NEW_TYPE_IDS_FOR_TEST = 10  # None for no limit
+MAX_NEW_TYPE_IDS_FOR_TEST = None  # None for no limit
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,6 +115,34 @@ def get_bq_client() -> bigquery.Client:
 # =========================
 # BIGQUERY SETUP
 # =========================
+def wait_for_table_ready(
+    client: bigquery.Client,
+    table_id: str,
+    max_wait_seconds: int = 30,
+    poll_interval: float = 2.0,
+) -> None:
+    start = time.time()
+
+    while True:
+        try:
+            client.get_table(table_id)
+            logging.info("Confirmed table is visible: %s", table_id)
+            return
+        except Exception:
+            elapsed = time.time() - start
+            if elapsed >= max_wait_seconds:
+                raise RuntimeError(
+                    f"Table {table_id} was created but was not visible after "
+                    f"{max_wait_seconds} seconds."
+                )
+            logging.info(
+                "Waiting for table metadata to propagate: %s (%.1fs elapsed)",
+                table_id,
+                elapsed,
+            )
+            time.sleep(poll_interval)
+
+
 def ensure_tables_exist(client: bigquery.Client) -> None:
     search_schema = [
         bigquery.SchemaField("run_id", "STRING"),
@@ -153,6 +181,9 @@ def ensure_tables_exist(client: bigquery.Client) -> None:
             table = bigquery.Table(table_id, schema=schema)
             client.create_table(table)
             logging.info("Created table: %s", table_id)
+            wait_for_table_ready(client, table_id)
+
+    time.sleep(5)
 
 
 # =========================
@@ -208,10 +239,6 @@ def build_search_query(issuer_name: str) -> str:
 
 
 def extract_possible_issuer_strings(item: Dict[str, Any]) -> List[str]:
-    """
-    Best-effort extraction from the raw API payload.
-    We do not assume one exact field shape because Numista may return nested issuer data.
-    """
     values = []
 
     for key in ["issuer", "country", "authority"]:
@@ -421,9 +448,11 @@ def append_json_rows(
         row_copy["load_timestamp"] = load_ts
         final_rows.append(row_copy)
 
-    errors = client.insert_rows_json(table_id, final_rows)
-    if errors:
-        raise RuntimeError(f"BigQuery insert errors for {table_id}: {errors}")
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND
+    )
+    job = client.load_table_from_json(final_rows, table_id, job_config=job_config)
+    job.result()
 
     logging.info("Inserted %s rows into %s", len(final_rows), table_id)
 
@@ -482,7 +511,7 @@ def main() -> None:
             for row in issuer_rows:
                 type_id = row["type_id"]
                 matched = row.get("matched_on_issuer_name", False)
-                if matched and type_id not in existing_detail_ids:
+                if matched:
                     new_type_ids.add(type_id)
 
             time.sleep(SLEEP_SECONDS)
@@ -496,7 +525,7 @@ def main() -> None:
                 MAX_NEW_TYPE_IDS_FOR_TEST
             )
 
-        logging.info("Discovered %s new type IDs to fetch", len(new_type_ids))
+        logging.info("Discovered %s candidate type IDs to fetch", len(new_type_ids))
 
         detail_rows: List[Dict[str, Any]] = []
 
