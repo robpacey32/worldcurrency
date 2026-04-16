@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Optional
@@ -28,17 +29,17 @@ SEARCH_PAGE_SIZE = 50
 SLEEP_SECONDS = 0.4
 REQUEST_TIMEOUT = 60
 
-# Hard stops to protect quota usage per run
 MAX_SEARCH_REQUESTS_PER_RUN = 250
 MAX_DETAIL_REQUESTS_PER_RUN = 1000
+
+TEST_ISSUERS = ["Slovakia"]   # set to [] to run all issuers
+MAX_NEW_TYPE_IDS_FOR_TEST = 10  # None for no limit
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-TEST_ISSUERS = ["Slovakia"]   # set to [] to run all issuers
-MAX_NEW_TYPE_IDS_FOR_TEST = 10  # None for no limit
 
 # =========================
 # AUTH / CLIENTS
@@ -116,18 +117,24 @@ def get_bq_client() -> bigquery.Client:
 # =========================
 def ensure_tables_exist(client: bigquery.Client) -> None:
     search_schema = [
+        bigquery.SchemaField("run_id", "STRING"),
         bigquery.SchemaField("load_timestamp", "TIMESTAMP"),
         bigquery.SchemaField("issuer_name", "STRING"),
         bigquery.SchemaField("search_query", "STRING"),
         bigquery.SchemaField("page_number", "INT64"),
+        bigquery.SchemaField("result_position", "INT64"),
         bigquery.SchemaField("type_id", "INT64"),
         bigquery.SchemaField("type_url", "STRING"),
         bigquery.SchemaField("title", "STRING"),
         bigquery.SchemaField("category", "STRING"),
+        bigquery.SchemaField("api_total", "INT64"),
+        bigquery.SchemaField("api_pages", "INT64"),
+        bigquery.SchemaField("matched_on_issuer_name", "BOOL"),
         bigquery.SchemaField("raw_result_json", "JSON"),
     ]
 
     detail_schema = [
+        bigquery.SchemaField("run_id", "STRING"),
         bigquery.SchemaField("load_timestamp", "TIMESTAMP"),
         bigquery.SchemaField("type_id", "INT64"),
         bigquery.SchemaField("category", "STRING"),
@@ -192,12 +199,57 @@ def numista_get(
             raise
 
         except requests.exceptions.RequestException as exc:
-            logging.warning("Transient request error: %s", exc)
+            logging.warning("Request failed for %s with params=%s: %s", path, params, exc)
             raise
 
 
 def build_search_query(issuer_name: str) -> str:
     return issuer_name.strip()
+
+
+def extract_possible_issuer_strings(item: Dict[str, Any]) -> List[str]:
+    """
+    Best-effort extraction from the raw API payload.
+    We do not assume one exact field shape because Numista may return nested issuer data.
+    """
+    values = []
+
+    for key in ["issuer", "country", "authority"]:
+        val = item.get(key)
+        if isinstance(val, str):
+            values.append(val)
+        elif isinstance(val, dict):
+            for subkey in ["name", "title", "text"]:
+                subval = val.get(subkey)
+                if isinstance(subval, str):
+                    values.append(subval)
+
+    issuers = item.get("issuers")
+    if isinstance(issuers, list):
+        for x in issuers:
+            if isinstance(x, str):
+                values.append(x)
+            elif isinstance(x, dict):
+                for subkey in ["name", "title", "text"]:
+                    subval = x.get(subkey)
+                    if isinstance(subval, str):
+                        values.append(subval)
+
+    return [v.strip() for v in values if isinstance(v, str) and v.strip()]
+
+
+def result_matches_issuer(issuer_name: str, item: Dict[str, Any]) -> bool:
+    issuer_lower = issuer_name.strip().lower()
+    possible_values = extract_possible_issuer_strings(item)
+
+    if any(v.lower() == issuer_lower for v in possible_values):
+        return True
+
+    title = str(item.get("title") or "").strip().lower()
+    if issuer_lower and issuer_lower in title:
+        return True
+
+    return False
 
 
 def search_type_ids_for_issuer(
@@ -236,30 +288,41 @@ def search_type_ids_for_issuer(
         search_requests_used += 1
 
         results = data.get("types") or data.get("results") or []
+        api_total = data.get("total")
+        api_pages = data.get("pages")
+
         if not results:
             break
 
-        for item in results:
+        kept = 0
+        for pos, item in enumerate(results, start=1):
             type_id = item.get("id")
             if type_id is None:
                 continue
+
+            matched = result_matches_issuer(issuer_name, item)
 
             all_rows.append({
                 "issuer_name": issuer_name,
                 "search_query": search_query,
                 "page_number": page,
+                "result_position": pos,
                 "type_id": int(type_id),
                 "type_url": f"{NUMISTA_BASE_URL}/types/{type_id}",
                 "title": item.get("title"),
                 "category": item.get("category", NUMISTA_CATEGORY),
+                "api_total": int(api_total) if api_total is not None else None,
+                "api_pages": int(api_pages) if api_pages is not None else None,
+                "matched_on_issuer_name": matched,
                 "raw_result_json": item,
             })
+            kept += 1
 
         logging.info(
             "Search issuer=%s page=%s returned %s rows",
             issuer_name,
             page,
-            len(results),
+            kept,
         )
 
         if len(results) < SEARCH_PAGE_SIZE:
@@ -278,7 +341,7 @@ def fetch_type_detail(
 ) -> Dict[str, Any]:
     data = numista_get(
         path=f"/types/{type_id}",
-        params={},
+        params={"lang": NUMISTA_LANG},
         key_manager=key_manager,
         session=session,
     )
@@ -302,6 +365,7 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
         logging.exception("BigQuery query failed.\nSQL:\n%s", sql)
         raise
 
+
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
     SELECT DISTINCT CAST(name AS STRING) AS issuer_name
@@ -314,13 +378,12 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     df = run_query_df(client, sql)
     issuers = df["issuer_name"].tolist()
 
-    logging.info("Loaded %s issuers from %s", len(issuers), COUNTRIES_SOURCE)
-
     if TEST_ISSUERS:
         test_set = {x.strip().lower() for x in TEST_ISSUERS}
         issuers = [x for x in issuers if x.strip().lower() in test_set]
         logging.info("TEST MODE: restricting issuers to %s", issuers)
 
+    logging.info("Loaded %s issuers from %s", len(issuers), COUNTRIES_SOURCE)
     return issuers
 
 
@@ -343,6 +406,7 @@ def append_json_rows(
     client: bigquery.Client,
     table_id: str,
     rows: List[Dict[str, Any]],
+    run_id: str,
 ) -> None:
     if not rows:
         logging.info("No rows to insert into %s", table_id)
@@ -353,6 +417,7 @@ def append_json_rows(
 
     for row in rows:
         row_copy = dict(row)
+        row_copy["run_id"] = run_id
         row_copy["load_timestamp"] = load_ts
         final_rows.append(row_copy)
 
@@ -367,18 +432,20 @@ def append_json_rows(
 # MAIN
 # =========================
 def main() -> None:
+    run_id = str(uuid.uuid4())
+
     client = get_bq_client()
     api_keys = get_api_keys()
     key_manager = APIKeyManager(api_keys)
 
+    logging.info("Run ID: %s", run_id)
     logging.info("Loaded %s Numista API keys", len(api_keys))
 
     ensure_tables_exist(client)
 
     issuers = get_issuers_to_search(client)
-    logging.info("Loaded %s issuers from %s", len(issuers), COUNTRIES_SOURCE)
-
     existing_detail_ids = get_existing_detail_ids(client)
+
     logging.info("Already have %s type details stored", len(existing_detail_ids))
 
     search_requests_used = 0
@@ -414,12 +481,13 @@ def main() -> None:
 
             for row in issuer_rows:
                 type_id = row["type_id"]
-                if type_id not in existing_detail_ids:
+                matched = row.get("matched_on_issuer_name", False)
+                if matched and type_id not in existing_detail_ids:
                     new_type_ids.add(type_id)
 
             time.sleep(SLEEP_SECONDS)
 
-        append_json_rows(client, SEARCH_RAW_TABLE, all_search_rows)
+        append_json_rows(client, SEARCH_RAW_TABLE, all_search_rows, run_id=run_id)
 
         if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
             new_type_ids = set(sorted(new_type_ids)[:MAX_NEW_TYPE_IDS_FOR_TEST])
@@ -457,7 +525,7 @@ def main() -> None:
 
             time.sleep(SLEEP_SECONDS)
 
-        append_json_rows(client, DETAIL_RAW_TABLE, detail_rows)
+        append_json_rows(client, DETAIL_RAW_TABLE, detail_rows, run_id=run_id)
 
     logging.info("Run complete.")
     logging.info("Search requests used: %s", search_requests_used)
