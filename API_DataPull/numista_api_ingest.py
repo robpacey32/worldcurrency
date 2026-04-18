@@ -32,7 +32,6 @@ SEARCH_PAGE_SIZE = 50
 SLEEP_SECONDS = 0.4
 REQUEST_TIMEOUT = 60
 
-# Sensible first full-run limits
 MAX_SEARCH_REQUESTS_PER_RUN = 100
 MAX_DETAIL_REQUESTS_PER_RUN = 250
 
@@ -395,20 +394,29 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
 
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
-    WITH countries AS (
+    WITH issuers AS (
       SELECT DISTINCT TRIM(CAST(name AS STRING)) AS issuer_name
       FROM `{COUNTRIES_SOURCE}`
       WHERE name IS NOT NULL
         AND TRIM(CAST(name AS STRING)) != ''
+    ),
+    search_loads AS (
+      SELECT
+        TRIM(CAST(issuer_name AS STRING)) AS issuer_name,
+        MAX(load_timestamp) AS last_search_load_timestamp
+      FROM `{SEARCH_RAW_TABLE}`
+      WHERE issuer_name IS NOT NULL
+        AND TRIM(CAST(issuer_name AS STRING)) != ''
+      GROUP BY 1
     )
-    SELECT c.issuer_name
-    FROM countries c
-    LEFT JOIN `{STATE_TABLE}` s
-      ON LOWER(c.issuer_name) = LOWER(s.issuer_name)
+    SELECT i.issuer_name
+    FROM issuers i
+    LEFT JOIN search_loads s
+      ON LOWER(i.issuer_name) = LOWER(s.issuer_name)
     ORDER BY
-      CASE WHEN s.last_successful_run_ts IS NULL THEN 0 ELSE 1 END,
-      s.last_successful_run_ts,
-      c.issuer_name
+      CASE WHEN s.last_search_load_timestamp IS NULL THEN 0 ELSE 1 END,
+      s.last_search_load_timestamp,
+      i.issuer_name
     """
 
     df = run_query_df(client, sql)
@@ -419,7 +427,10 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
         issuers = [x for x in issuers if x.strip().lower() in test_set]
         logging.info("TEST MODE: restricting issuers to %s", issuers)
 
-    logging.info("Loaded %s issuers ordered by oldest successful run", len(issuers))
+    logging.info(
+        "Loaded %s issuers ordered by null/oldest search load timestamp",
+        len(issuers),
+    )
     return issuers
 
 
@@ -464,6 +475,41 @@ def append_json_rows(
     job.result()
 
     logging.info("Inserted %s rows into %s", len(final_rows), table_id)
+
+
+def append_progress_row(
+    client: bigquery.Client,
+    run_id: str,
+    issuer_name: str,
+    stage: str,
+    status: str,
+    search_rows_written: Optional[int] = None,
+    detail_rows_written: Optional[int] = None,
+    message: Optional[str] = None,
+) -> None:
+    row = [{
+        "run_id": run_id,
+        "issuer_name": issuer_name,
+        "stage": stage,
+        "status": status,
+        "search_rows_written": search_rows_written,
+        "detail_rows_written": detail_rows_written,
+        "message": message,
+        "load_timestamp": datetime.now(timezone.utc).isoformat(),
+    }]
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND
+    )
+    job = client.load_table_from_json(row, PROGRESS_TABLE, job_config=job_config)
+    job.result()
+
+    logging.info(
+        "Progress logged | issuer=%s | stage=%s | status=%s",
+        issuer_name,
+        stage,
+        status,
+    )
 
 
 def upsert_country_state(
@@ -605,10 +651,20 @@ def main() -> None:
                 append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
                 total_search_rows_written += len(issuer_rows)
 
+                append_progress_row(
+                    client=client,
+                    run_id=run_id,
+                    issuer_name=issuer_name,
+                    stage="issuer_search_complete",
+                    status="SUCCESS",
+                    search_rows_written=len(issuer_rows),
+                    detail_rows_written=0,
+                    message="Search rows written successfully",
+                )
+
                 for row in issuer_rows:
                     type_id = row["type_id"]
-                    matched = row.get("matched_on_issuer_name", False)
-                    if matched and type_id not in existing_detail_ids:
+                    if type_id not in existing_detail_ids:
                         issuer_type_ids.add(type_id)
 
                 if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
@@ -620,7 +676,7 @@ def main() -> None:
                     )
 
                 logging.info(
-                    "Issuer=%s has %s new matched type IDs to fetch",
+                    "Issuer=%s has %s new type IDs to fetch",
                     issuer_name,
                     len(issuer_type_ids),
                 )
@@ -657,6 +713,21 @@ def main() -> None:
                 remaining_unfetched = len(issuer_type_ids) - len(issuer_detail_rows)
                 if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN and remaining_unfetched > 0:
                     current_stage = "issuer_detail_partial"
+
+                    append_progress_row(
+                        client=client,
+                        run_id=run_id,
+                        issuer_name=issuer_name,
+                        stage="issuer_detail_complete",
+                        status="FAILED",
+                        search_rows_written=len(issuer_rows),
+                        detail_rows_written=len(issuer_detail_rows),
+                        message=(
+                            f"Detail guardrail reached before issuer completed. "
+                            f"{remaining_unfetched} type IDs remaining."
+                        ),
+                    )
+
                     upsert_country_state(
                         client=client,
                         issuer_name=issuer_name,
@@ -669,6 +740,7 @@ def main() -> None:
                         search_rows_written=len(issuer_rows),
                         detail_rows_written=len(issuer_detail_rows),
                     )
+
                     logging.warning(
                         "Issuer=%s not fully completed due to detail guardrail",
                         issuer_name,
@@ -676,6 +748,18 @@ def main() -> None:
                     break
 
                 current_stage = "issuer_detail_complete"
+
+                append_progress_row(
+                    client=client,
+                    run_id=run_id,
+                    issuer_name=issuer_name,
+                    stage="issuer_detail_complete",
+                    status="SUCCESS",
+                    search_rows_written=len(issuer_rows),
+                    detail_rows_written=len(issuer_detail_rows),
+                    message="Issuer completed successfully",
+                )
+
                 upsert_country_state(
                     client=client,
                     issuer_name=issuer_name,
@@ -700,6 +784,23 @@ def main() -> None:
                     current_stage,
                     exc,
                 )
+
+                try:
+                    append_progress_row(
+                        client=client,
+                        run_id=run_id,
+                        issuer_name=issuer_name,
+                        stage=current_stage,
+                        status="FAILED",
+                        search_rows_written=len(issuer_rows),
+                        detail_rows_written=len(issuer_detail_rows),
+                        message=str(exc),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Failed to write progress row for issuer=%s after error",
+                        issuer_name,
+                    )
 
                 try:
                     upsert_country_state(
