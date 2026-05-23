@@ -421,6 +421,7 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
       CASE WHEN s.last_search_load_timestamp IS NULL THEN 0 ELSE 1 END,
       s.last_search_load_timestamp ASC,
       i.issuer_name ASC
+      LIMIT 10
     """
 
     df = run_query_df(client, sql)
