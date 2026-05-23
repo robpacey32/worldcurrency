@@ -395,7 +395,9 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
     WITH issuers AS (
-      SELECT DISTINCT TRIM(CAST(name AS STRING)) AS issuer_name
+      SELECT DISTINCT
+        TRIM(CAST(name AS STRING)) AS issuer_name,
+        SAFE_CAST(priority_bucket AS INT64) AS priority_bucket
       FROM `{COUNTRIES_SOURCE}`
       WHERE name IS NOT NULL
         AND TRIM(CAST(name AS STRING)) != ''
@@ -409,14 +411,16 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
         AND TRIM(CAST(issuer_name AS STRING)) != ''
       GROUP BY 1
     )
-    SELECT i.issuer_name
+    SELECT
+      i.issuer_name
     FROM issuers i
     LEFT JOIN search_loads s
       ON LOWER(i.issuer_name) = LOWER(s.issuer_name)
     ORDER BY
+      COALESCE(i.priority_bucket, 50) ASC,
       CASE WHEN s.last_search_load_timestamp IS NULL THEN 0 ELSE 1 END,
-      s.last_search_load_timestamp,
-      i.issuer_name
+      s.last_search_load_timestamp ASC,
+      i.issuer_name ASC
     """
 
     df = run_query_df(client, sql)
@@ -428,7 +432,7 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
         logging.info("TEST MODE: restricting issuers to %s", issuers)
 
     logging.info(
-        "Loaded %s issuers ordered by null/oldest search load timestamp",
+        "Loaded %s issuers ordered by priority bucket, then null/oldest search load timestamp",
         len(issuers),
     )
     return issuers
