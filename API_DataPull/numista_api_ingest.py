@@ -417,11 +417,10 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     LEFT JOIN search_loads s
       ON LOWER(i.issuer_name) = LOWER(s.issuer_name)
     ORDER BY
-      COALESCE(i.priority_bucket, 50) ASC,
       CASE WHEN s.last_search_load_timestamp IS NULL THEN 0 ELSE 1 END,
+      COALESCE(i.priority_bucket, 50) ASC,
       s.last_search_load_timestamp ASC,
       i.issuer_name ASC
-      LIMIT 10
     """
 
     df = run_query_df(client, sql)
