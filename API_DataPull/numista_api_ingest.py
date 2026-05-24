@@ -28,12 +28,15 @@ STATE_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_country_refresh_state"
 NUMISTA_BASE_URL = "https://api.numista.com/v3"
 NUMISTA_CATEGORY = "banknote"
 NUMISTA_LANG = "en"
+
 SEARCH_PAGE_SIZE = 50
-SLEEP_SECONDS = 0.4
+SLEEP_SECONDS = 2.0
 REQUEST_TIMEOUT = 60
 
 MAX_SEARCH_REQUESTS_PER_RUN = 500
 MAX_DETAIL_REQUESTS_PER_RUN = 2500
+
+PROGRESS_BATCH_SIZE = 50
 
 TEST_ISSUERS = []   # set to [] to run all issuers
 MAX_NEW_TYPE_IDS_FOR_TEST = None  # None for no limit
@@ -207,7 +210,22 @@ def numista_get(
             )
 
             if response.status_code == 429:
-                key_manager.mark_current_key_failed("HTTP 429 rate/quota limit")
+                retry_after = response.headers.get("Retry-After")
+                wait_seconds = (
+                    int(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else 60
+                )
+
+                logging.warning(
+                    "HTTP 429 rate/quota limit hit for %s with params=%s. "
+                    "Sleeping for %s seconds before retrying same key.",
+                    path,
+                    params,
+                    wait_seconds,
+                )
+
+                time.sleep(wait_seconds)
                 continue
 
             if response.status_code in (401, 403):
@@ -222,8 +240,31 @@ def numista_get(
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
 
-            if status_code in (401, 403, 429):
+            if status_code in (401, 403):
                 key_manager.mark_current_key_failed(f"HTTP {status_code}")
+                continue
+
+            if status_code == 429:
+                retry_after = (
+                    exc.response.headers.get("Retry-After")
+                    if exc.response is not None
+                    else None
+                )
+                wait_seconds = (
+                    int(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else 60
+                )
+
+                logging.warning(
+                    "HTTP 429 raised as HTTPError for %s with params=%s. "
+                    "Sleeping for %s seconds before retrying same key.",
+                    path,
+                    params,
+                    wait_seconds,
+                )
+
+                time.sleep(wait_seconds)
                 continue
 
             raise
@@ -391,7 +432,6 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
         logging.exception("BigQuery query failed.\nSQL:\n%s", sql)
         raise
 
-
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
     WITH issuers AS (
@@ -432,7 +472,7 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
         logging.info("TEST MODE: restricting issuers to %s", issuers)
 
     logging.info(
-        "Loaded %s issuers ordered by priority bucket, then null/oldest search load timestamp",
+        "Loaded %s issuers ordered by missing search data, priority bucket, then oldest search timestamp",
         len(issuers),
     )
     return issuers
@@ -481,8 +521,7 @@ def append_json_rows(
     logging.info("Inserted %s rows into %s", len(final_rows), table_id)
 
 
-def append_progress_row(
-    client: bigquery.Client,
+def build_progress_row(
     run_id: str,
     issuer_name: str,
     stage: str,
@@ -490,8 +529,8 @@ def append_progress_row(
     search_rows_written: Optional[int] = None,
     detail_rows_written: Optional[int] = None,
     message: Optional[str] = None,
-) -> None:
-    row = [{
+) -> Dict[str, Any]:
+    return {
         "run_id": run_id,
         "issuer_name": issuer_name,
         "stage": stage,
@@ -500,20 +539,67 @@ def append_progress_row(
         "detail_rows_written": detail_rows_written,
         "message": message,
         "load_timestamp": datetime.now(timezone.utc).isoformat(),
-    }]
+    }
+
+
+def flush_progress_rows(
+    client: bigquery.Client,
+    progress_buffer: List[Dict[str, Any]],
+) -> None:
+    if not progress_buffer:
+        return
 
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND
     )
-    job = client.load_table_from_json(row, PROGRESS_TABLE, job_config=job_config)
+
+    job = client.load_table_from_json(
+        progress_buffer,
+        PROGRESS_TABLE,
+        job_config=job_config,
+    )
     job.result()
 
     logging.info(
-        "Progress logged | issuer=%s | stage=%s | status=%s",
+        "Inserted %s progress rows into %s",
+        len(progress_buffer),
+        PROGRESS_TABLE,
+    )
+
+    progress_buffer.clear()
+
+
+def add_progress_row(
+    client: bigquery.Client,
+    progress_buffer: List[Dict[str, Any]],
+    run_id: str,
+    issuer_name: str,
+    stage: str,
+    status: str,
+    search_rows_written: Optional[int] = None,
+    detail_rows_written: Optional[int] = None,
+    message: Optional[str] = None,
+) -> None:
+    progress_buffer.append(build_progress_row(
+        run_id=run_id,
+        issuer_name=issuer_name,
+        stage=stage,
+        status=status,
+        search_rows_written=search_rows_written,
+        detail_rows_written=detail_rows_written,
+        message=message,
+    ))
+
+    logging.info(
+        "Progress buffered | issuer=%s | stage=%s | status=%s | buffer_size=%s",
         issuer_name,
         stage,
         status,
+        len(progress_buffer),
     )
+
+    if len(progress_buffer) >= PROGRESS_BATCH_SIZE:
+        flush_progress_rows(client, progress_buffer)
 
 
 def upsert_country_state(
@@ -623,6 +709,7 @@ def main() -> None:
     detail_requests_used = 0
     total_search_rows_written = 0
     total_detail_rows_written = 0
+    progress_buffer: List[Dict[str, Any]] = []
 
     with requests.Session() as session:
         for issuer_name in issuers:
@@ -655,8 +742,9 @@ def main() -> None:
                 append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
                 total_search_rows_written += len(issuer_rows)
 
-                append_progress_row(
+                add_progress_row(
                     client=client,
+                    progress_buffer=progress_buffer,
                     run_id=run_id,
                     issuer_name=issuer_name,
                     stage="issuer_search_complete",
@@ -718,18 +806,21 @@ def main() -> None:
                 if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN and remaining_unfetched > 0:
                     current_stage = "issuer_detail_partial"
 
-                    append_progress_row(
+                    partial_message = (
+                        f"Detail guardrail reached before issuer completed. "
+                        f"{remaining_unfetched} type IDs remaining."
+                    )
+
+                    add_progress_row(
                         client=client,
+                        progress_buffer=progress_buffer,
                         run_id=run_id,
                         issuer_name=issuer_name,
                         stage="issuer_detail_complete",
                         status="FAILED",
                         search_rows_written=len(issuer_rows),
                         detail_rows_written=len(issuer_detail_rows),
-                        message=(
-                            f"Detail guardrail reached before issuer completed. "
-                            f"{remaining_unfetched} type IDs remaining."
-                        ),
+                        message=partial_message,
                     )
 
                     upsert_country_state(
@@ -737,10 +828,7 @@ def main() -> None:
                         issuer_name=issuer_name,
                         run_id=run_id,
                         status="FAILED",
-                        message=(
-                            f"Detail guardrail reached before issuer completed. "
-                            f"{remaining_unfetched} type IDs remaining."
-                        ),
+                        message=partial_message,
                         search_rows_written=len(issuer_rows),
                         detail_rows_written=len(issuer_detail_rows),
                     )
@@ -753,8 +841,9 @@ def main() -> None:
 
                 current_stage = "issuer_detail_complete"
 
-                append_progress_row(
+                add_progress_row(
                     client=client,
+                    progress_buffer=progress_buffer,
                     run_id=run_id,
                     issuer_name=issuer_name,
                     stage="issuer_detail_complete",
@@ -790,8 +879,9 @@ def main() -> None:
                 )
 
                 try:
-                    append_progress_row(
+                    add_progress_row(
                         client=client,
+                        progress_buffer=progress_buffer,
                         run_id=run_id,
                         issuer_name=issuer_name,
                         stage=current_stage,
@@ -802,7 +892,7 @@ def main() -> None:
                     )
                 except Exception:
                     logging.exception(
-                        "Failed to write progress row for issuer=%s after error",
+                        "Failed to buffer/write progress row for issuer=%s after error",
                         issuer_name,
                     )
 
@@ -825,6 +915,8 @@ def main() -> None:
                 continue
 
             time.sleep(SLEEP_SECONDS)
+
+    flush_progress_rows(client, progress_buffer)
 
     logging.info("Run complete.")
     logging.info("Search requests used: %s", search_requests_used)
