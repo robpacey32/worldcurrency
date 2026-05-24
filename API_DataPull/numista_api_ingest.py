@@ -211,21 +211,18 @@ def numista_get(
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                wait_seconds = (
-                    int(retry_after)
-                    if retry_after and retry_after.isdigit()
-                    else 60
-                )
+                wait_seconds = int(retry_after) if retry_after and retry_after.isdigit() else 10
 
                 logging.warning(
                     "HTTP 429 rate/quota limit hit for %s with params=%s. "
-                    "Sleeping for %s seconds before retrying same key.",
+                    "Sleeping for %s seconds, then switching API key.",
                     path,
                     params,
                     wait_seconds,
                 )
 
                 time.sleep(wait_seconds)
+                key_manager.mark_current_key_failed("HTTP 429 rate/quota limit")
                 continue
 
             if response.status_code in (401, 403):
@@ -250,21 +247,18 @@ def numista_get(
                     if exc.response is not None
                     else None
                 )
-                wait_seconds = (
-                    int(retry_after)
-                    if retry_after and retry_after.isdigit()
-                    else 60
-                )
+                wait_seconds = int(retry_after) if retry_after and retry_after.isdigit() else 10
 
                 logging.warning(
                     "HTTP 429 raised as HTTPError for %s with params=%s. "
-                    "Sleeping for %s seconds before retrying same key.",
+                    "Sleeping for %s seconds, then switching API key.",
                     path,
                     params,
                     wait_seconds,
                 )
 
                 time.sleep(wait_seconds)
+                key_manager.mark_current_key_failed("HTTP 429 rate/quota limit")
                 continue
 
             raise
