@@ -884,6 +884,10 @@ def main() -> None:
                         issuer_name,
                     )
 
+                if "All Numista API keys exhausted" in str(exc):
+                    logging.error("All Numista API keys exhausted. Stopping run.")
+                    break
+
                 continue
 
             time.sleep(SLEEP_SECONDS)
