@@ -24,6 +24,7 @@ SEARCH_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_search_results"
 DETAIL_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_type_detail"
 PROGRESS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_api_progress"
 STATE_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_country_refresh_state"
+API_RUN_ORDER_VIEW = f"{PROJECT_ID}.{DATASET_ID}.2_API_RunOrder"
 
 NUMISTA_BASE_URL = "https://api.numista.com/v3"
 NUMISTA_CATEGORY = "banknote"
@@ -428,33 +429,9 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
 
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
-    WITH issuers AS (
-      SELECT DISTINCT
-        TRIM(CAST(name AS STRING)) AS issuer_name,
-        SAFE_CAST(priority_bucket AS INT64) AS priority_bucket
-      FROM `{COUNTRIES_SOURCE}`
-      WHERE name IS NOT NULL
-        AND TRIM(CAST(name AS STRING)) != ''
-    ),
-    search_loads AS (
-      SELECT
-        TRIM(CAST(issuer_name AS STRING)) AS issuer_name,
-        MAX(load_timestamp) AS last_search_load_timestamp
-      FROM `{SEARCH_RAW_TABLE}`
-      WHERE issuer_name IS NOT NULL
-        AND TRIM(CAST(issuer_name AS STRING)) != ''
-      GROUP BY 1
-    )
-    SELECT
-      i.issuer_name
-    FROM issuers i
-    LEFT JOIN search_loads s
-      ON LOWER(i.issuer_name) = LOWER(s.issuer_name)
-    ORDER BY
-      CASE WHEN s.last_search_load_timestamp IS NULL THEN 0 ELSE 1 END,
-      COALESCE(i.priority_bucket, 50) ASC,
-      s.last_search_load_timestamp ASC,
-      i.issuer_name ASC
+    SELECT issuer_name
+    FROM `{API_RUN_ORDER_VIEW}`
+    ORDER BY api_run_order
     """
 
     df = run_query_df(client, sql)
@@ -466,9 +443,10 @@ def get_issuers_to_search(client: bigquery.Client) -> List[str]:
         logging.info("TEST MODE: restricting issuers to %s", issuers)
 
     logging.info(
-        "Loaded %s issuers ordered by missing search data, priority bucket, then oldest search timestamp",
+        "Loaded %s issuers from API run order view",
         len(issuers),
     )
+
     return issuers
 
 
