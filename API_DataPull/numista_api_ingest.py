@@ -36,12 +36,18 @@ SLEEP_SECONDS = 2.0
 REQUEST_TIMEOUT = 60
 
 MAX_SEARCH_REQUESTS_PER_RUN = 500
-MAX_DETAIL_REQUESTS_PER_RUN = 2500
+
+# Production: 2500
+# Testing: 5
+MAX_DETAIL_REQUESTS_PER_RUN = 5
 
 PROGRESS_BATCH_SIZE = 50
 
+# Production: []
+# Testing: ["Germany"]
 TEST_ISSUERS = ["Germany"]
-MAX_DETAIL_REQUESTS_PER_RUN = 5
+
+MAX_NEW_TYPE_IDS_FOR_TEST = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -617,6 +623,28 @@ def get_pending_type_ids_for_issuer(
     return df["type_id"].astype(int).tolist()
 
 
+def get_pending_type_count_for_issuer(
+    client: bigquery.Client,
+    issuer_name: str,
+) -> int:
+    issuer_name_sql = json.dumps(issuer_name)
+
+    sql = f"""
+    SELECT COUNT(*) AS pending_count
+    FROM `{TYPE_STATE_TABLE}`
+    WHERE LOWER(TRIM(CAST(issuer_name AS STRING))) = LOWER(TRIM({issuer_name_sql}))
+      AND detail_status IN ('PENDING', 'FAILED')
+      AND type_id IS NOT NULL
+    """
+
+    df = run_query_df(client, sql)
+
+    if df.empty:
+        return 0
+
+    return int(df["pending_count"].iloc[0])
+
+
 def mark_type_details_complete(
     client: bigquery.Client,
     type_ids: List[int],
@@ -841,7 +869,6 @@ def upsert_country_state(
         detail_rows_written,
     )
 
-
 # =========================
 # MAIN
 # =========================
@@ -872,9 +899,6 @@ def main() -> None:
     with requests.Session() as session:
         for issuer_name in issuers:
             remaining_search = MAX_SEARCH_REQUESTS_PER_RUN - search_requests_used
-            if remaining_search <= 0:
-                logging.warning("Search guardrail reached for this run.")
-                break
 
             issuer_rows: List[Dict[str, Any]] = []
             issuer_type_ids: Set[int] = set()
@@ -885,39 +909,71 @@ def main() -> None:
             try:
                 logging.info("Starting issuer: %s", issuer_name)
 
-                issuer_rows = search_type_ids_for_issuer(
-                    issuer_name=issuer_name,
-                    key_manager=key_manager,
-                    max_search_requests_remaining=remaining_search,
-                    session=session,
-                )
-                current_stage = "issuer_search_complete"
-
-                issuer_pages_used = len({
-                    (r["issuer_name"], r["page_number"]) for r in issuer_rows
-                })
-                search_requests_used += issuer_pages_used
-
-                append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
-                total_search_rows_written += len(issuer_rows)
-
-                upsert_type_state_from_search_results(
+                existing_pending_count = get_pending_type_count_for_issuer(
                     client=client,
                     issuer_name=issuer_name,
-                    run_id=run_id,
                 )
 
-                add_progress_row(
-                    client=client,
-                    progress_buffer=progress_buffer,
-                    run_id=run_id,
-                    issuer_name=issuer_name,
-                    stage="issuer_search_complete",
-                    status="SUCCESS",
-                    search_rows_written=len(issuer_rows),
-                    detail_rows_written=0,
-                    message="Search rows written successfully",
-                )
+                if existing_pending_count > 0:
+                    current_stage = "issuer_search_skipped"
+
+                    logging.info(
+                        "Issuer=%s already has %s pending type IDs in %s. Skipping search stage.",
+                        issuer_name,
+                        existing_pending_count,
+                        TYPE_STATE_TABLE,
+                    )
+
+                    add_progress_row(
+                        client=client,
+                        progress_buffer=progress_buffer,
+                        run_id=run_id,
+                        issuer_name=issuer_name,
+                        stage="issuer_search_skipped",
+                        status="SUCCESS",
+                        search_rows_written=0,
+                        detail_rows_written=0,
+                        message=f"Skipped search because {existing_pending_count} pending type IDs already exist",
+                    )
+
+                else:
+                    if remaining_search <= 0:
+                        logging.warning("Search guardrail reached for this run.")
+                        break
+
+                    issuer_rows = search_type_ids_for_issuer(
+                        issuer_name=issuer_name,
+                        key_manager=key_manager,
+                        max_search_requests_remaining=remaining_search,
+                        session=session,
+                    )
+                    current_stage = "issuer_search_complete"
+
+                    issuer_pages_used = len({
+                        (r["issuer_name"], r["page_number"]) for r in issuer_rows
+                    })
+                    search_requests_used += issuer_pages_used
+
+                    append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
+                    total_search_rows_written += len(issuer_rows)
+
+                    upsert_type_state_from_search_results(
+                        client=client,
+                        issuer_name=issuer_name,
+                        run_id=run_id,
+                    )
+
+                    add_progress_row(
+                        client=client,
+                        progress_buffer=progress_buffer,
+                        run_id=run_id,
+                        issuer_name=issuer_name,
+                        stage="issuer_search_complete",
+                        status="SUCCESS",
+                        search_rows_written=len(issuer_rows),
+                        detail_rows_written=0,
+                        message="Search rows written successfully",
+                    )
 
                 remaining_detail_capacity = MAX_DETAIL_REQUESTS_PER_RUN - detail_requests_used
 
@@ -980,13 +1036,18 @@ def main() -> None:
 
                 existing_detail_ids.update(successful_type_ids)
 
-                remaining_unfetched = len(issuer_type_ids) - len(issuer_detail_rows)
-                if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN and remaining_unfetched > 0:
+                total_pending_after_batch = get_pending_type_count_for_issuer(
+                    client=client,
+                    issuer_name=issuer_name,
+                )
+
+                if total_pending_after_batch > 0:
                     current_stage = "issuer_detail_partial"
 
                     partial_message = (
-                        f"Detail guardrail reached before issuer completed. "
-                        f"{remaining_unfetched} type IDs remaining."
+                        f"Detail batch completed. "
+                        f"{len(issuer_detail_rows)} type IDs fetched this run. "
+                        f"{total_pending_after_batch} type IDs still pending."
                     )
 
                     add_progress_row(
@@ -994,8 +1055,8 @@ def main() -> None:
                         progress_buffer=progress_buffer,
                         run_id=run_id,
                         issuer_name=issuer_name,
-                        stage="issuer_detail_complete",
-                        status="FAILED",
+                        stage="issuer_detail_partial",
+                        status="PARTIAL",
                         search_rows_written=len(issuer_rows),
                         detail_rows_written=len(issuer_detail_rows),
                         message=partial_message,
@@ -1005,17 +1066,24 @@ def main() -> None:
                         client=client,
                         issuer_name=issuer_name,
                         run_id=run_id,
-                        status="FAILED",
+                        status="PARTIAL",
                         message=partial_message,
                         search_rows_written=len(issuer_rows),
                         detail_rows_written=len(issuer_detail_rows),
                     )
 
-                    logging.warning(
-                        "Issuer=%s not fully completed due to detail guardrail",
+                    logging.info(
+                        "Issuer=%s partially complete | detail rows this run=%s | pending remaining=%s",
                         issuer_name,
+                        len(issuer_detail_rows),
+                        total_pending_after_batch,
                     )
-                    break
+
+                    if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN:
+                        logging.warning("Detail guardrail reached for this run.")
+                        break
+
+                    continue
 
                 current_stage = "issuer_detail_complete"
 
