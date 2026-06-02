@@ -40,8 +40,8 @@ MAX_DETAIL_REQUESTS_PER_RUN = 2500
 
 PROGRESS_BATCH_SIZE = 50
 
-TEST_ISSUERS = []   # set to [] to run all issuers
-MAX_NEW_TYPE_IDS_FOR_TEST = None  # None for no limit
+TEST_ISSUERS = ["Germany"]
+MAX_DETAIL_REQUESTS_PER_RUN = 5
 
 logging.basicConfig(
     level=logging.INFO,
