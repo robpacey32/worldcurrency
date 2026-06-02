@@ -25,6 +25,7 @@ DETAIL_RAW_TABLE = f"{PROJECT_ID}.{DATASET_ID}.raw_numista_type_detail"
 PROGRESS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_api_progress"
 STATE_TABLE = f"{PROJECT_ID}.{DATASET_ID}.numista_country_refresh_state"
 API_RUN_ORDER_VIEW = f"{PROJECT_ID}.{DATASET_ID}.2_API_RunOrder"
+TYPE_STATE_TABLE = f"{PROJECT_ID}.{DATASET_ID}.3_TypeRefreshState"
 
 NUMISTA_BASE_URL = "https://api.numista.com/v3"
 NUMISTA_CATEGORY = "banknote"
@@ -172,11 +173,27 @@ def ensure_tables_exist(client: bigquery.Client) -> None:
         bigquery.SchemaField("updated_at", "TIMESTAMP"),
     ]
 
+    type_state_schema = [
+        bigquery.SchemaField("type_id", "INT64", mode="REQUIRED"),
+        bigquery.SchemaField("issuer_name", "STRING"),
+        bigquery.SchemaField("category", "STRING"),
+        bigquery.SchemaField("detail_status", "STRING"),
+        bigquery.SchemaField("detail_attempt_count", "INT64"),
+        bigquery.SchemaField("detail_last_attempted_at", "TIMESTAMP"),
+        bigquery.SchemaField("detail_completed_at", "TIMESTAMP"),
+        bigquery.SchemaField("detail_last_error", "STRING"),
+        bigquery.SchemaField("first_seen_at", "TIMESTAMP"),
+        bigquery.SchemaField("last_seen_at", "TIMESTAMP"),
+        bigquery.SchemaField("run_id", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ]
+
     for table_id, schema in [
         (SEARCH_RAW_TABLE, search_schema),
         (DETAIL_RAW_TABLE, detail_schema),
         (PROGRESS_TABLE, progress_schema),
         (STATE_TABLE, state_schema),
+        (TYPE_STATE_TABLE, type_state_schema),
     ]:
         try:
             client.get_table(table_id)
@@ -427,6 +444,15 @@ def run_query_df(client: bigquery.Client, sql: str) -> pd.DataFrame:
         logging.exception("BigQuery query failed.\nSQL:\n%s", sql)
         raise
 
+
+def run_query(client: bigquery.Client, sql: str) -> None:
+    try:
+        client.query(sql).result()
+    except Exception:
+        logging.exception("BigQuery statement failed.\nSQL:\n%s", sql)
+        raise
+
+
 def get_issuers_to_search(client: bigquery.Client) -> List[str]:
     sql = f"""
     SELECT issuer_name
@@ -491,6 +517,164 @@ def append_json_rows(
     job.result()
 
     logging.info("Inserted %s rows into %s", len(final_rows), table_id)
+
+
+def upsert_type_state_from_search_results(
+    client: bigquery.Client,
+    issuer_name: str,
+    run_id: str,
+) -> None:
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    issuer_name_sql = json.dumps(issuer_name)
+    run_id_sql = json.dumps(run_id)
+
+    sql = f"""
+    MERGE `{TYPE_STATE_TABLE}` AS target
+    USING (
+      SELECT
+        s.type_id,
+        ARRAY_AGG(TRIM(CAST(s.issuer_name AS STRING)) IGNORE NULLS ORDER BY s.load_timestamp DESC LIMIT 1)[OFFSET(0)] AS issuer_name,
+        ARRAY_AGG(TRIM(CAST(s.category AS STRING)) IGNORE NULLS ORDER BY s.load_timestamp DESC LIMIT 1)[OFFSET(0)] AS category,
+        MIN(s.load_timestamp) AS first_seen_at,
+        MAX(s.load_timestamp) AS last_seen_at,
+        {run_id_sql} AS run_id,
+        TIMESTAMP('{now_ts}') AS updated_at
+      FROM `{SEARCH_RAW_TABLE}` s
+      WHERE s.type_id IS NOT NULL
+        AND LOWER(TRIM(CAST(s.issuer_name AS STRING))) = LOWER(TRIM({issuer_name_sql}))
+      GROUP BY s.type_id
+    ) AS source
+    ON target.type_id = source.type_id
+
+    WHEN MATCHED THEN UPDATE SET
+      issuer_name = source.issuer_name,
+      category = source.category,
+      first_seen_at = COALESCE(target.first_seen_at, source.first_seen_at),
+      last_seen_at = GREATEST(COALESCE(target.last_seen_at, source.last_seen_at), source.last_seen_at),
+      run_id = source.run_id,
+      updated_at = source.updated_at
+
+    WHEN NOT MATCHED THEN INSERT (
+      type_id,
+      issuer_name,
+      category,
+      detail_status,
+      detail_attempt_count,
+      detail_last_attempted_at,
+      detail_completed_at,
+      detail_last_error,
+      first_seen_at,
+      last_seen_at,
+      run_id,
+      updated_at
+    )
+    VALUES (
+      source.type_id,
+      source.issuer_name,
+      source.category,
+      'PENDING',
+      0,
+      NULL,
+      NULL,
+      NULL,
+      source.first_seen_at,
+      source.last_seen_at,
+      source.run_id,
+      source.updated_at
+    )
+    """
+
+    run_query(client, sql)
+    logging.info("Upserted type state rows from search results for issuer=%s", issuer_name)
+
+
+def get_pending_type_ids_for_issuer(
+    client: bigquery.Client,
+    issuer_name: str,
+    limit: int,
+) -> List[int]:
+    if limit <= 0:
+        return []
+
+    issuer_name_sql = json.dumps(issuer_name)
+
+    sql = f"""
+    SELECT type_id
+    FROM `{TYPE_STATE_TABLE}`
+    WHERE LOWER(TRIM(CAST(issuer_name AS STRING))) = LOWER(TRIM({issuer_name_sql}))
+      AND detail_status IN ('PENDING', 'FAILED')
+      AND type_id IS NOT NULL
+    ORDER BY type_id
+    LIMIT {int(limit)}
+    """
+
+    df = run_query_df(client, sql)
+
+    if df.empty:
+        return []
+
+    return df["type_id"].astype(int).tolist()
+
+
+def mark_type_details_complete(
+    client: bigquery.Client,
+    type_ids: List[int],
+    run_id: str,
+) -> None:
+    if not type_ids:
+        return
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+    run_id_sql = json.dumps(run_id)
+    type_ids_sql = ", ".join(str(int(x)) for x in sorted(set(type_ids)))
+
+    sql = f"""
+    UPDATE `{TYPE_STATE_TABLE}`
+    SET
+      detail_status = 'COMPLETE',
+      detail_attempt_count = COALESCE(detail_attempt_count, 0) + 1,
+      detail_last_attempted_at = TIMESTAMP('{now_ts}'),
+      detail_completed_at = TIMESTAMP('{now_ts}'),
+      detail_last_error = NULL,
+      run_id = {run_id_sql},
+      updated_at = TIMESTAMP('{now_ts}')
+    WHERE type_id IN ({type_ids_sql})
+    """
+
+    run_query(client, sql)
+    logging.info("Marked %s type details as COMPLETE", len(set(type_ids)))
+
+
+def mark_type_details_failed(
+    client: bigquery.Client,
+    type_ids: List[int],
+    run_id: str,
+    error_message: str,
+) -> None:
+    if not type_ids:
+        return
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+    run_id_sql = json.dumps(run_id)
+    error_sql = json.dumps(error_message[:1000])
+    type_ids_sql = ", ".join(str(int(x)) for x in sorted(set(type_ids)))
+
+    sql = f"""
+    UPDATE `{TYPE_STATE_TABLE}`
+    SET
+      detail_status = 'FAILED',
+      detail_attempt_count = COALESCE(detail_attempt_count, 0) + 1,
+      detail_last_attempted_at = TIMESTAMP('{now_ts}'),
+      detail_last_error = {error_sql},
+      run_id = {run_id_sql},
+      updated_at = TIMESTAMP('{now_ts}')
+    WHERE type_id IN ({type_ids_sql})
+      AND detail_status != 'COMPLETE'
+    """
+
+    run_query(client, sql)
+    logging.info("Marked %s type details as FAILED", len(set(type_ids)))
 
 
 def build_progress_row(
@@ -646,7 +830,9 @@ def upsert_country_state(
         source.updated_at
       )
     """
-    client.query(sql).result()
+
+    run_query(client, sql)
+
     logging.info(
         "Updated state | issuer=%s | status=%s | search_rows=%s | detail_rows=%s",
         issuer_name,
@@ -693,6 +879,7 @@ def main() -> None:
             issuer_rows: List[Dict[str, Any]] = []
             issuer_type_ids: Set[int] = set()
             issuer_detail_rows: List[Dict[str, Any]] = []
+            attempted_type_ids: List[int] = []
             current_stage = "issuer_search_started"
 
             try:
@@ -714,6 +901,12 @@ def main() -> None:
                 append_json_rows(client, SEARCH_RAW_TABLE, issuer_rows, run_id=run_id)
                 total_search_rows_written += len(issuer_rows)
 
+                upsert_type_state_from_search_results(
+                    client=client,
+                    issuer_name=issuer_name,
+                    run_id=run_id,
+                )
+
                 add_progress_row(
                     client=client,
                     progress_buffer=progress_buffer,
@@ -726,21 +919,24 @@ def main() -> None:
                     message="Search rows written successfully",
                 )
 
-                for row in issuer_rows:
-                    type_id = row["type_id"]
-                    if type_id not in existing_detail_ids:
-                        issuer_type_ids.add(type_id)
+                remaining_detail_capacity = MAX_DETAIL_REQUESTS_PER_RUN - detail_requests_used
+
+                issuer_type_ids = set(get_pending_type_ids_for_issuer(
+                    client=client,
+                    issuer_name=issuer_name,
+                    limit=remaining_detail_capacity,
+                ))
 
                 if MAX_NEW_TYPE_IDS_FOR_TEST is not None:
                     issuer_type_ids = set(sorted(issuer_type_ids)[:MAX_NEW_TYPE_IDS_FOR_TEST])
                     logging.info(
-                        "TEST MODE: limiting issuer=%s new type IDs to first %s",
+                        "TEST MODE: limiting issuer=%s pending type IDs to first %s",
                         issuer_name,
                         MAX_NEW_TYPE_IDS_FOR_TEST,
                     )
 
                 logging.info(
-                    "Issuer=%s has %s new type IDs to fetch",
+                    "Issuer=%s has %s pending type IDs to fetch",
                     issuer_name,
                     len(issuer_type_ids),
                 )
@@ -760,6 +956,8 @@ def main() -> None:
                         type_id,
                     )
 
+                    attempted_type_ids.append(type_id)
+
                     detail_row = fetch_type_detail(
                         type_id=type_id,
                         key_manager=key_manager,
@@ -772,7 +970,15 @@ def main() -> None:
                 append_json_rows(client, DETAIL_RAW_TABLE, issuer_detail_rows, run_id=run_id)
                 total_detail_rows_written += len(issuer_detail_rows)
 
-                existing_detail_ids.update({row["type_id"] for row in issuer_detail_rows})
+                successful_type_ids = [row["type_id"] for row in issuer_detail_rows]
+
+                mark_type_details_complete(
+                    client=client,
+                    type_ids=successful_type_ids,
+                    run_id=run_id,
+                )
+
+                existing_detail_ids.update(successful_type_ids)
 
                 remaining_unfetched = len(issuer_type_ids) - len(issuer_detail_rows)
                 if detail_requests_used >= MAX_DETAIL_REQUESTS_PER_RUN and remaining_unfetched > 0:
@@ -849,6 +1055,33 @@ def main() -> None:
                     current_stage,
                     exc,
                 )
+
+                successful_type_ids = [row["type_id"] for row in issuer_detail_rows]
+                failed_type_ids = [
+                    x for x in attempted_type_ids
+                    if x not in set(successful_type_ids)
+                ]
+
+                try:
+                    if successful_type_ids:
+                        mark_type_details_complete(
+                            client=client,
+                            type_ids=successful_type_ids,
+                            run_id=run_id,
+                        )
+
+                    if failed_type_ids:
+                        mark_type_details_failed(
+                            client=client,
+                            type_ids=failed_type_ids,
+                            run_id=run_id,
+                            error_message=str(exc),
+                        )
+                except Exception:
+                    logging.exception(
+                        "Failed to update type state after issuer error for issuer=%s",
+                        issuer_name,
+                    )
 
                 try:
                     add_progress_row(
