@@ -39,13 +39,13 @@ MAX_SEARCH_REQUESTS_PER_RUN = 500
 
 # Production: 2500
 # Testing: 5
-MAX_DETAIL_REQUESTS_PER_RUN = 5
+MAX_DETAIL_REQUESTS_PER_RUN = 2500
 
 PROGRESS_BATCH_SIZE = 50
 
 # Production: []
 # Testing: ["Germany"]
-TEST_ISSUERS = ["Germany"]
+TEST_ISSUERS = []
 
 MAX_NEW_TYPE_IDS_FOR_TEST = None
 
